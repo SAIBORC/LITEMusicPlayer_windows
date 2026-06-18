@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio user files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+# Build logs
+*.log
+*.tlog
+
+# ReSharper
+_ReSharper*/
+*.DotSettings.user
+
+# Visual Studio Code
+.vscode/
