@@ -1,3 +1,8 @@
+<img width="500" height="400" alt="Screenshot 2026-06-19 141903" src="https://github.com/user-attachments/assets/83aede74-8d5c-48ea-ae94-d992f4df0656" />
+
+
+
+
 # LITE Music Player
 
 A lightweight, native Windows music player written in C++ with the Win32 API. No frameworks, no web tech — just a single `.cpp` file and a pure Win32 UI.
