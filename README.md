@@ -80,6 +80,7 @@ LitePlayerCPP/
 
 ## Credits
 
+- the OG coder its from (https://github.com/RafaelLourenco17706/LITE-Music-Player) by RafaelLourenco17706
 - OGG/Vorbis decoding via [stb_vorbis.h](https://github.com/nothings/stb) by Sean Barrett
 - Icon from [SongNoteIcon](https://www.flaticon.com/)
 
