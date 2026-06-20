@@ -65,12 +65,19 @@ static void InitWCA() {
         if (h) s_wca = (WCAFunc)GetProcAddress(h, "SetWindowCompositionAttribute");
     }
 }
-static void SetAcrylicBlur(HWND hw, bool enable) {
+static void SetAcrylicBlur(HWND hw, int intensity) {
     InitWCA();
     if (!s_wca) return;
     ACCENTPOLICY ap = {};
     WINCOMPATTR wc = {19, &ap, sizeof(ap)};
-    if (enable) { ap.state = 4; ap.color = 0x99121212; }
+    if (intensity > 0) {
+        ap.state = 4;
+        int a = intensity * 180 / 100;
+        if (a > 180) a = 180;
+        // Blend base color from light (glass) to dark (blur)
+        int c = 0xE0 - (intensity * 0xC8 / 100);
+        ap.color = (DWORD)((a << 24) | (c << 16) | (c << 8) | c);
+    }
     s_wca(hw, &wc);
 }
 
@@ -94,8 +101,13 @@ static int            g_windowAlpha   = 255;
 static int            g_rainbowTick   = 0;
 static bool           g_rainbowEnabled = true;
 static bool           g_acrylicBlur    = true;
+static int            g_blurIntensity  = 50;
+static bool           g_blurSliding    = false;
+static RECT           g_blurSliderRect = {};
 static int            g_manualEvent    = -1;
 static bool           g_useLightTheme = false;
+static RECT           g_cacheBtnRect = {};
+static RECT           g_loadAllBtnRect = {};
 
 // Audio output device selection (empty = default system device)
 static std::vector<std::wstring> g_audioDeviceNames; // display names for dropdown
@@ -300,10 +312,11 @@ static const int ART_SZ     = 180;
 static const int PADDING    = 12;
 
 enum BtnID {
-    BTN_NONE=0, BTN_PLAY, BTN_STOP, BTN_PREV, BTN_NEXT,
-    BTN_SHUFFLE, BTN_VOLUME, BTN_MUTE, BTN_SETTINGS,
-    BTN_LOCATE, BTN_EQ,
-    BTN_WIDGET, BTN_CLOSE, BTN_MINIMIZE, BTN_MAXIMIZE, BTN_LAST
+    BTN_NONE=0,
+    BTN_SHUFFLE, BTN_STOP, BTN_PREV, BTN_PLAY, BTN_NEXT,
+    BTN_SETTINGS, BTN_LOCATE, BTN_VOLUME,
+    BTN_SEARCH, BTN_EQ, BTN_WIDGET, BTN_MINIMIZE, BTN_MAXIMIZE, BTN_CLOSE,
+    BTN_LAST
 };
 
 static HINSTANCE    g_hInst       = NULL;
@@ -479,6 +492,7 @@ static void InitTooltips() {
     g_btnTooltips[BTN_VOLUME]   = L"Volume (click to mute)";
     g_btnTooltips[BTN_SETTINGS] = L"Settings";
     g_btnTooltips[BTN_LOCATE]   = L"Locate Current Track";
+    g_btnTooltips[BTN_SEARCH]   = L"Search Playlist";
     g_btnTooltips[BTN_EQ]       = L"Equalizer";
     g_btnTooltips[BTN_WIDGET]   = L"Toggle Compact Mode";
     g_btnTooltips[BTN_CLOSE]    = L"Close";
@@ -675,19 +689,22 @@ static void UpdateSMTC() {
 // ---------------------------------------------------------------------------
 static void CalcLayout(const RECT &rc) {
     int w = rc.right - rc.left;
-    int bh = BOTTOM_H, bw = 28, bgap = 4;
+    int bh = BOTTOM_H;
+    int bw = (w < 600) ? 22 : 28;
+    int bgap = 4;
     int by = rc.bottom - bh + (bh - bw) / 2 + 4;
     int cx = PADDING + 85;
     SetRect(&g_btnRects[BTN_SHUFFLE],  cx,   by,  cx+bw,   by+bw);   cx += bw+bgap;
     SetRect(&g_btnRects[BTN_STOP],     cx,   by,  cx+bw,   by+bw);   cx += bw+bgap+8;
     SetRect(&g_btnRects[BTN_PREV],     cx,   by,  cx+bw,   by+bw);   cx += bw+bgap;
-    SetRect(&g_btnRects[BTN_PLAY],     cx-2, by-2, cx-2+bw+4, by-2+bw+4); cx += bw+bgap+4;
+    SetRect(&g_btnRects[BTN_PLAY],     cx,   by,  cx+bw,   by+bw);   cx += bw+bgap;
     SetRect(&g_btnRects[BTN_NEXT],     cx,   by,  cx+bw,   by+bw);   cx += bw+bgap+8;
     SetRect(&g_btnRects[BTN_SETTINGS], cx,   by,  cx+bw,   by+bw);   cx += bw+bgap;
-    SetRect(&g_btnRects[BTN_LOCATE],   cx,   by,  cx+bw,   by+bw);   cx += bw+bgap;
-    SetRect(&g_btnRects[BTN_MUTE],     w-PADDING-150-24, by, w-PADDING-150-4, by+bw);
-    SetRect(&g_btnRects[BTN_VOLUME],   w-PADDING-150, by, w-PADDING-150+24, by+bw);
+    SetRect(&g_btnRects[BTN_LOCATE],   cx,   by,  cx+bw,   by+bw);   cx += bw+bgap+8;
+    SetRect(&g_btnRects[BTN_VOLUME],   cx,   by,  cx+bw,   by+bw);
+    // Title bar buttons
     int tbw = 20, tby = (TITLE_H-tbw)/2;
+    SetRect(&g_btnRects[BTN_SEARCH],   w-PADDING-tbw*6-10, tby, w-PADDING-tbw*5-10, tby+tbw);
     SetRect(&g_btnRects[BTN_EQ],       w-PADDING-tbw*5-8, tby, w-PADDING-tbw*4-8, tby+tbw);
     SetRect(&g_btnRects[BTN_WIDGET],   w-PADDING-tbw*4-6, tby, w-PADDING-tbw*3-6, tby+tbw);
     SetRect(&g_btnRects[BTN_MINIMIZE], w-PADDING-tbw*3-4, tby, w-PADDING-tbw*2-4, tby+tbw);
@@ -764,12 +781,252 @@ static void ParseID3(const wchar_t *path) {
 // Per-file metadata cache for the browser
 static std::vector<std::wstring> g_songTitles;
 static std::vector<std::wstring> g_songArtists;
+static std::vector<int> g_songDurations;
+static std::vector<bool> g_metaCached;
+static std::vector<int> g_metaPending;
+static CRITICAL_SECTION g_metaCS;
+static HANDLE g_hMetaThread = NULL;
+static HANDLE g_hMetaWakeEvent = NULL;
+static volatile bool g_metaThreadRun = false;
 
 static void CacheCurrentMeta() {
     int i = g_trackIdx;
     if (i < 0 || i >= (int)g_songTitles.size()) return;
+    EnterCriticalSection(&g_metaCS);
     g_songTitles[i] = g_songTitle;
     g_songArtists[i] = g_artistName;
+    g_songDurations[i] = g_maxSec;
+    g_metaCached[i] = true;
+    LeaveCriticalSection(&g_metaCS);
+}
+
+static int DurationFromFile(const wchar_t *path) {
+    const wchar_t *ext = wcsrchr(path, L'.');
+    if (!ext) return 0;
+    wchar_t lowExt[8]; swprintf(lowExt,8,L"%s",ext);
+    for(wchar_t *p=lowExt;*p;p++)*p=towlower(*p);
+    if (wcscmp(lowExt, L".ogg") == 0) {
+        char pathA[1024]; WideCharToMultiByte(CP_UTF8,0,path,-1,pathA,sizeof(pathA),NULL,NULL);
+        stb_vorbis *v = stb_vorbis_open_filename(pathA, NULL, NULL);
+        if (!v) return 0;
+        float sec = stb_vorbis_stream_length_in_seconds(v);
+        stb_vorbis_close(v);
+        return (int)(sec + 0.5f);
+    }
+    if (wcscmp(lowExt, L".wav") == 0) {
+        FILE *f = _wfopen(path, L"rb");
+        if (!f) return 0;
+        unsigned char h[44];
+        if (fread(h,1,44,f)!=44||memcmp(h,"RIFF",4)!=0||memcmp(h+8,"WAVE",4)!=0){fclose(f);return 0;}
+        int sr=*(int*)(h+24), bps=*(int*)(h+28), dataSz=0;
+        if (*(int*)(h+36)!=0x61746164){
+            fseek(f,44,SEEK_SET); unsigned char ch[8];
+            while (fread(ch,1,8,f)==8){if(memcmp(ch,"data",4)==0){dataSz=*(int*)(ch+4);break;} fseek(f,*(int*)(ch+4),SEEK_CUR);}
+        } else dataSz=*(int*)(h+40);
+        fclose(f);
+        if(sr>0&&bps>0) return dataSz/(sr*(bps/8));
+        return 0;
+    }
+    if (wcscmp(lowExt, L".flac") == 0) {
+        FILE *f = _wfopen(path, L"rb");
+        if (!f) return 0;
+        unsigned char h[42];
+        if (fread(h,1,42,f)!=42||memcmp(h,"fLaC",4)!=0){fclose(f);return 0;}
+        int sr=(h[18]<<12)|(h[19]<<4)|(h[20]>>4);
+        long long total=((long long)(h[20]&0x0F)<<32)|((long long)h[21]<<24)|(h[22]<<16)|(h[23]<<8)|h[24];
+        fclose(f);
+        if(sr>0&&total>0) return (int)(total/sr);
+        return 0;
+    }
+    IMFSourceReader *r=NULL;
+    if (SUCCEEDED(MFCreateSourceReaderFromURL(path, NULL, &r))) {
+        PROPVARIANT pv; PropVariantInit(&pv);
+        HRESULT hr=r->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv);
+        int dur=0;
+        if(SUCCEEDED(hr)&&pv.vt==VT_UI8) dur=(int)(pv.uhVal.QuadPart/10000000);
+        PropVariantClear(&pv); r->Release();
+        return dur;
+    }
+    return 0;
+}
+
+static void CacheFileMeta(int idx) {
+    if (idx < 0 || idx >= (int)g_playlist.size()) return;
+    const wchar_t *path = g_playlist[idx].c_str();
+    // Duration
+    g_songDurations[idx] = DurationFromFile(path);
+    // Title/artist for MP3 via ID3
+    const wchar_t *ext = wcsrchr(path, L'.');
+    if (ext) {
+        wchar_t lowExt[8]; swprintf(lowExt,8,L"%s",ext);
+        for(wchar_t *p=lowExt;*p;p++)*p=towlower(*p);
+        if (wcscmp(lowExt, L".mp3") == 0) {
+            Gdiplus::Image *oldArt = g_albumArt; g_albumArt = NULL;
+            std::wstring oldTitle = g_songTitle, oldArtist = g_artistName;
+            ParseID3(path);
+            if (!g_songTitle.empty()) g_songTitles[idx] = g_songTitle;
+            if (!g_artistName.empty()) g_songArtists[idx] = g_artistName;
+            if (g_albumArt && idx < (int)g_thumbs.size()) {
+                if (g_thumbs[idx]) delete g_thumbs[idx];
+                g_thumbs[idx] = new Gdiplus::Bitmap(32, 32);
+                Gdiplus::Graphics g((Gdiplus::Bitmap*)g_thumbs[idx]);
+                g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                g.DrawImage(g_albumArt, 0, 0, 32, 32);
+            }
+            if (g_albumArt) delete g_albumArt;
+            g_albumArt = oldArt;
+            g_songTitle = oldTitle; g_artistName = oldArtist;
+        }
+    }
+}
+
+static std::wstring GetExeDir() {
+    wchar_t buf[MAX_PATH]; GetModuleFileNameW(NULL, buf, MAX_PATH);
+    wchar_t *p = wcsrchr(buf, L'\\'); if (p) *p = 0;
+    return buf;
+}
+
+static std::wstring GetCacheDir() {
+    // Use directory of first playlist entry as key
+    if (g_playlist.empty()) return L"";
+    std::wstring key = g_playlist[0];
+    size_t bs = key.rfind(L'\\');
+    if (bs != std::wstring::npos) key = key.substr(0, bs);
+    for (auto &c : key) { if (c == L'\\' || c == L':' || c == L'/') c = L'_'; }
+    return GetExeDir() + L"\\cache_" + key + L".bin";
+}
+
+static __int64 GetTotalCacheSize() {
+    __int64 total = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((GetExeDir() + L"\\cache_*.bin").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { total += ((__int64)fd.nFileSizeHigh << 32) + fd.nFileSizeLow; }
+        while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return total;
+}
+
+static void DeleteAllCacheFiles() {
+    WIN32_FIND_DATAW fd;
+    std::wstring pattern = GetExeDir() + L"\\cache_*.bin";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            DeleteFileW((GetExeDir() + L"\\" + fd.cFileName).c_str());
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    // Reset metadata so it gets re-scanned
+    g_songTitles.assign(g_playlist.size(), L"");
+    g_songArtists.assign(g_playlist.size(), L"");
+    g_songDurations.assign(g_playlist.size(), 0);
+    g_metaCached.assign(g_playlist.size(), false);
+}
+
+static void SaveMetaCache() {
+    std::wstring cp = GetCacheDir();
+    if (g_playlist.empty()) return;
+    FILE *f = _wfopen(cp.c_str(), L"wb");
+    if (!f) return;
+    int cnt = (int)g_playlist.size();
+    fwrite("LMC1", 4, 1, f);
+    fwrite(&cnt, 4, 1, f);
+    for (int i = 0; i < cnt; i++) {
+        int tl = (int)g_songTitles[i].size() * 2;
+        fwrite(&tl, 4, 1, f);
+        if (tl > 0) fwrite(g_songTitles[i].c_str(), 2, g_songTitles[i].size(), f);
+        int al = (int)g_songArtists[i].size() * 2;
+        fwrite(&al, 4, 1, f);
+        if (al > 0) fwrite(g_songArtists[i].c_str(), 2, g_songArtists[i].size(), f);
+        fwrite(&g_songDurations[i], 4, 1, f);
+    }
+    fclose(f);
+}
+
+static bool LoadMetaCache() {
+    std::wstring cp = GetCacheDir();
+    if (g_playlist.empty()) return false;
+    FILE *f = _wfopen(cp.c_str(), L"rb");
+    if (!f) return false;
+    char magic[4];
+    if (fread(magic,1,4,f)!=4 || memcmp(magic,"LMC1",4)!=0) { fclose(f); return false; }
+    int cnt;
+    if (fread(&cnt,4,1,f)!=1 || cnt != (int)g_playlist.size()) { fclose(f); return false; }
+    for (int i = 0; i < cnt; i++) {
+        int tl = 0, al = 0, dur = 0;
+        if (fread(&tl,4,1,f)!=1) { fclose(f); return false; }
+        std::wstring t; t.resize(tl/2);
+        if (tl > 0 && (int)fread(&t[0],2,tl/2,f) != tl/2) { fclose(f); return false; }
+        if (fread(&al,4,1,f)!=1) { fclose(f); return false; }
+        std::wstring a; a.resize(al/2);
+        if (al > 0 && (int)fread(&a[0],2,al/2,f) != al/2) { fclose(f); return false; }
+        if (fread(&dur,4,1,f)!=1) { fclose(f); return false; }
+        g_songTitles[i] = t; g_songArtists[i] = a; g_songDurations[i] = dur;
+    }
+    fclose(f);
+    std::fill(g_metaCached.begin(), g_metaCached.end(), true);
+    return true;
+}
+
+static void CacheMetaRange(int centerIdx) {
+    if (g_playlist.empty() || !g_metaThreadRun) return;
+    int total = (int)g_playlist.size();
+    int start = max(0, centerIdx - 15);
+    int end = min(total - 1, centerIdx + 25);
+    bool added = false;
+    EnterCriticalSection(&g_metaCS);
+    for (int i = start; i <= end; i++) {
+        if (i < (int)g_metaCached.size() && !g_metaCached[i]) {
+            if (std::find(g_metaPending.begin(), g_metaPending.end(), i) == g_metaPending.end()) {
+                g_metaPending.push_back(i);
+                added = true;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_metaCS);
+    if (added) SetEvent(g_hMetaWakeEvent);
+}
+
+static void QueueAllMeta() {
+    if (g_playlist.empty() || !g_metaThreadRun) return;
+    bool added = false;
+    EnterCriticalSection(&g_metaCS);
+    for (int i = 0; i < (int)g_playlist.size(); i++) {
+        if (i < (int)g_metaCached.size() && !g_metaCached[i]) {
+            if (std::find(g_metaPending.begin(), g_metaPending.end(), i) == g_metaPending.end()) {
+                g_metaPending.push_back(i);
+                added = true;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_metaCS);
+    if (added) SetEvent(g_hMetaWakeEvent);
+}
+
+static DWORD WINAPI MetaThreadProc(LPVOID) {
+    while (g_metaThreadRun) {
+        WaitForSingleObject(g_hMetaWakeEvent, INFINITE);
+        if (!g_metaThreadRun) break;
+        while (g_metaThreadRun) {
+            EnterCriticalSection(&g_metaCS);
+            if (g_metaPending.empty()) { LeaveCriticalSection(&g_metaCS); break; }
+            int idx = g_metaPending.back();
+            g_metaPending.pop_back();
+            bool last = g_metaPending.empty();
+            LeaveCriticalSection(&g_metaCS);
+            CacheFileMeta(idx);
+            EnterCriticalSection(&g_metaCS);
+            g_metaCached[idx] = true;
+            LeaveCriticalSection(&g_metaCS);
+            PostMessageW(g_hWnd, WM_APP, 0, 0);
+            if (last) {
+                PostMessageW(g_hWnd, WM_APP + 1, 0, 0);
+            }
+        }
+    }
+    return 0;
 }
 
 static Gdiplus::Image *LoadThumb(int idx) {
@@ -1610,9 +1867,14 @@ static void OpenFolder() {
     std::sort(g_playlist.begin(),g_playlist.end());
     if(g_playlist.empty()){ MessageBoxW(g_hWnd,L"No audio files found.",L"LITE Music Player",MB_OK|MB_ICONINFORMATION); g_inOpenFolder = false; return; }
     g_hasFolder=true; g_trackIdx=0; g_browserScroll=0;
-    // Init metadata cache
+    // Init metadata cache (lazy — only visible range + buffer)
     g_songTitles.assign(g_playlist.size(), L"");
     g_songArtists.assign(g_playlist.size(), L"");
+    g_songDurations.assign(g_playlist.size(), 0);
+    g_metaCached.assign(g_playlist.size(), false);
+    // Try loading persistent cache first
+    if (!LoadMetaCache())
+        CacheMetaRange(0);
     for (auto *t : g_thumbs) if (t) delete t;
     g_thumbs.assign(g_playlist.size(), NULL);
     PlayFile(g_playlist[0].c_str(),false);
@@ -1626,12 +1888,12 @@ static void OpenFolder() {
 static bool PtInBtn(POINT pt, BtnID id) { return PtInRect(&g_btnRects[id],pt); }
 
 static void SeekRect(const RECT &rc, int&x,int&y,int&w,int&h) {
-    x=PADDING; y=rc.bottom-BOTTOM_H+8; w=(rc.right-rc.left)-PADDING*2; h=14;
+    x=PADDING; y=rc.bottom-BOTTOM_H+8; w=rc.right-PADDING-x; h=10;
 }
 static bool InSeek(POINT pt,const RECT&rc){int x,y,w,h;SeekRect(rc,x,y,w,h);RECT r={x,y,x+w,y+h};return PtInRect(&r,pt);}
 static int SeekPct(POINT pt,const RECT&rc){int x,y,w,h;SeekRect(rc,x,y,w,h);if(pt.x<x)return 0;if(pt.x>x+w)return 10000;return(int)((float)(pt.x-x)/w*10000);}
 
-static void VolRect(int&x,int&y,int&w,int&h){RECT&vb=g_btnRects[BTN_VOLUME];x=vb.right+6;y=vb.top+2;w=100;h=vb.bottom-vb.top-4;}
+static void VolRect(int&x,int&y,int&w,int&h){RECT&vb=g_btnRects[BTN_VOLUME];x=vb.right+4;y=vb.top+2;w=min(100,(g_rcClient.right-x-8));h=vb.bottom-vb.top-4;}
 static bool InVol(POINT pt){int x,y,w,h;VolRect(x,y,w,h);RECT r={x,y,x+w,y+h};return PtInRect(&r,pt);}
 static float VolPos(POINT pt){int x,y,w,h;VolRect(x,y,w,h);if(pt.x<x)return 0;if(pt.x>x+w)return 1.0f;return(float)(pt.x-x)/w;}
 
@@ -1674,7 +1936,6 @@ static void ApplyEQ(short *samples, int frames, int channels) {
 // Drawing helpers
 // ---------------------------------------------------------------------------
 static void DrawBtnShape(HDC hdc, RECT r, int shape) {
-    // shape: 0=play triangle, 1=pause (two bars), 2=stop (square), 3=prev, 4=next, 5=shuffle
     HPEN hp=CreatePen(PS_SOLID,1,COL_TEXT);
     HPEN old=(HPEN)SelectObject(hdc,hp);
     HBRUSH hb=CreateSolidBrush(COL_TEXT);
@@ -1688,30 +1949,26 @@ static void DrawBtnShape(HDC hdc, RECT r, int shape) {
         POINT pts[3]={{cx-hs/2,cy-hs},{cx-hs/2,cy+hs},{cx+hs,cy}};
         Polygon(hdc,pts,3);
     } else if (shape==1) { // pause (two vertical bars)
-        int bw = hs/2 - 1; if (bw < 2) bw = 2;
-        RECT b1 = {cx - bw - 1, cy - hs + 3, cx - 1, cy + hs - 3};
-        RECT b2 = {cx + 1, cy - hs + 3, cx + bw + 1, cy + hs - 3};
+        int bw = hs/2;
+        RECT b1 = {cx - bw - 2, cy - hs + 2, cx - 2, cy + hs - 2};
+        RECT b2 = {cx + 2, cy - hs + 2, cx + bw + 2, cy + hs - 2};
         FillRect(hdc, &b1, hb); FillRect(hdc, &b2, hb);
     } else if (shape==2) { // stop (filled square)
-        int s2 = hs - 1;
+        int s2 = hs;
         RECT sr={cx-s2,cy-s2,cx+s2,cy+s2};
         FillRect(hdc,&sr,hb);
     } else if (shape==3) { // prev (left-pointing triangle + bar)
-        RECT bar = {cx - hs/2 - 2, cy - hs, cx - hs/2, cy + hs};
+        int third = hs/2;
+        RECT bar = {cx - hs - 2, cy - hs, cx - hs, cy + hs};
         FillRect(hdc, &bar, hb);
-        POINT pts[3]={{cx+hs/2,cy-hs},{cx+hs/2,cy+hs},{cx-hs/2-2,cy}};
+        POINT pts[3]={{cx+third+2,cy-hs},{cx+third+2,cy+hs},{cx-hs-2,cy}};
         Polygon(hdc,pts,3);
     } else if (shape==4) { // next (right-pointing triangle + bar)
-        RECT bar = {cx + hs/2, cy - hs, cx + hs/2 + 2, cy + hs};
+        int third = hs/2;
+        RECT bar = {cx + hs, cy - hs, cx + hs + 2, cy + hs};
         FillRect(hdc, &bar, hb);
-        POINT pts[3]={{cx-hs/2,cy-hs},{cx-hs/2,cy+hs},{cx+hs/2+2,cy}};
+        POINT pts[3]={{cx-third-2,cy-hs},{cx-third-2,cy+hs},{cx+hs+2,cy}};
         Polygon(hdc,pts,3);
-    } else if (shape==5) { // shuffle
-        RECT tr={r.left,r.top,r.right,r.bottom};
-        SetTextColor(hdc,COL_TEXT);
-        SelectObject(hdc,g_hFont);
-        SetBkMode(hdc,TRANSPARENT);
-        DrawTextW(hdc,L"\u21BB",-1,&tr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
     SelectObject(hdc,ob); DeleteObject(hb);
@@ -1924,7 +2181,7 @@ static void DrawTitleBar(HDC hdc, const RECT &rc) {
         SetTextColor(hdc, COL_TEXT_DIM);
         DrawTextW(hdc, tc, -1, &tcr, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     }
-    for(int i=BTN_EQ;i<=BTN_MAXIMIZE;i++){
+    for(int i=BTN_SEARCH;i<BTN_LAST;i++){
         BtnID id=(BtnID)i; RECT&br=g_btnRects[id];
         COLORREF bg = COL_TITLE_BG, tc = COL_TEXT;
         if(id==BTN_CLOSE){
@@ -1945,6 +2202,14 @@ static void DrawTitleBar(HDC hdc, const RECT &rc) {
             int cx=(br.left+br.right)/2, cy=(br.top+br.bottom)/2;
             MoveToEx(hdc,cx-5,cy-5,NULL); LineTo(hdc,cx+5,cy+5);
             MoveToEx(hdc,cx+5,cy-5,NULL); LineTo(hdc,cx-5,cy+5);
+            SelectObject(hdc,op); DeleteObject(hp);
+        } else if(id==BTN_SEARCH){
+            HPEN hp=CreatePen(PS_SOLID,1,tc);
+            HPEN op=(HPEN)SelectObject(hdc,hp);
+            SelectObject(hdc,GetStockObject(NULL_BRUSH));
+            int cx=(br.left+br.right)/2, cy=(br.top+br.bottom)/2;
+            Ellipse(hdc,cx-5,cy-5,cx+3,cy+3);
+            MoveToEx(hdc,cx+1,cy+1,NULL); LineTo(hdc,cx+6,cy+6);
             SelectObject(hdc,op); DeleteObject(hp);
         } else if(id==BTN_EQ){
             wchar_t eq[]=L"EQ";
@@ -2001,8 +2266,10 @@ static void ApplyTheme() {
     }
 }
 
+static void DrawSliderGDI(HDC hdc, int x, int y, int w, int h, float pct);
+
 static void DrawSettingsPanel(HDC hdc) {
-    int pw = 300, ph = 500, px = 0, py = 0;
+    int pw = 300, ph = 560, px = 0, py = 0;
     RECT fullR={px,py,px+pw,py+ph}; HBRUSH hb = CreateSolidBrush(COL_BG_DARK); FillRect(hdc, &fullR, hb); DeleteObject(hb);
     HPEN hp = CreatePen(PS_SOLID, 1, COL_TEXT_DIM);
     HPEN opOld = (HPEN)SelectObject(hdc, hp);
@@ -2144,6 +2411,17 @@ static void DrawSettingsPanel(HDC hdc) {
     RECT abL = {px + 34, abY - 2, px + pw - 12, abY + 16};
     SelectObject(hdc, g_hFont);
     DrawTextW(hdc, L"Acrylic Blur", -1, &abL, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    // Blur intensity slider (only visible when blur is on)
+    if (g_acrylicBlur) {
+        int slY = abY + 22, slH = 8, slW = pw - 40, slX = px + 20;
+        g_blurSliderRect = {slX, slY, slX + slW, slY + slH};
+        DrawSliderGDI(hdc, slX, slY, slW, slH, g_blurIntensity / 100.0f);
+        wchar_t lbl[16]; swprintf(lbl, 16, L"Intensity: %d%%", g_blurIntensity);
+        SetTextColor(hdc, COL_TEXT_DIM);
+        SelectObject(hdc, g_hFont);
+        RECT slLbl = {slX, slY + slH + 2, slX + slW, slY + slH + 16};
+        DrawTextW(hdc, lbl, -1, &slLbl, DT_CENTER|DT_TOP|DT_SINGLELINE);
+    } else g_blurSliderRect = {};
     // Audio Output device dropdown
     int devY = abY + 30, ddBtnH = 22;
     RECT devH = {px + 12, devY, px + pw - 12, devY + 20};
@@ -2181,8 +2459,54 @@ static void DrawSettingsPanel(HDC hdc) {
     SelectObject(hdc, oap); DeleteObject(aPen);
     g_audioDdBtn = ddR;
 
-    // About section
-    int aboutY = devY + 56;
+    // Cache section
+    int cacheY = devY + 52;
+    HPEN caSep = CreatePen(PS_SOLID, 1, COL_TEXT_DIM);
+    HPEN ocaSep = (HPEN)SelectObject(hdc, caSep);
+    MoveToEx(hdc, px + 12, cacheY, NULL); LineTo(hdc, px + pw - 12, cacheY);
+    SelectObject(hdc, ocaSep); DeleteObject(caSep);
+    SelectObject(hdc, g_hFontBold);
+    SetTextColor(hdc, COL_TEXT);
+    RECT caL = {px + 12, cacheY + 6, px + pw - 12, cacheY + 26};
+    DrawTextW(hdc, L"Cache", -1, &caL, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    // "Load All" button — green accent, white text centered
+    int laY = cacheY + 28, laH = 26;
+    RECT laBtn = {px + 16, laY, px + pw - 16, laY + laH};
+    g_loadAllBtnRect = laBtn;
+    HBRUSH laBg = CreateSolidBrush(g_accentColor);
+    FillRect(hdc, &laBtn, laBg); DeleteObject(laBg);
+    SetTextColor(hdc, RGB(0xFF, 0xFF, 0xFF));
+    SelectObject(hdc, g_hFontBold);
+    RECT laTxt = laBtn; laTxt.left += 4; laTxt.right -= 4;
+    DrawTextW(hdc, L"Load All", -1, &laTxt, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    // Clear Cache button — black bg, red border, red "Clear" text
+    int cbY = laY + laH + 6, cbH = 26;
+    RECT cacheBtn = {px + 16, cbY, px + pw - 16, cbY + cbH};
+    g_cacheBtnRect = cacheBtn;
+    HBRUSH cbBg = CreateSolidBrush(RGB(0x05, 0x05, 0x05));
+    FillRect(hdc, &cacheBtn, cbBg); DeleteObject(cbBg);
+    HPEN cbPen = CreatePen(PS_SOLID, 1, RGB(0xBB, 0x22, 0x22));
+    HPEN ocbPen = (HPEN)SelectObject(hdc, cbPen);
+    SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, cacheBtn.left, cacheBtn.top, cacheBtn.right, cacheBtn.bottom);
+    SelectObject(hdc, ocbPen); DeleteObject(cbPen);
+    // Cache size in gray on left
+    __int64 cBytes = GetTotalCacheSize();
+    wchar_t cbStr[32];
+    if (cBytes >= 1024 * 1024) swprintf(cbStr, 32, L"%.1f MB", cBytes / (1024.0 * 1024.0));
+    else if (cBytes >= 1024) swprintf(cbStr, 32, L"%.1f KB", cBytes / 1024.0);
+    else swprintf(cbStr, 32, L"%lld B", cBytes);
+    SelectObject(hdc, g_hFont);
+    SetTextColor(hdc, COL_TEXT_DIM);
+    RECT szR = cacheBtn; szR.left += 8; szR.right -= 76;
+    DrawTextW(hdc, cbStr, -1, &szR, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    // "Clear" in red on right
+    SetTextColor(hdc, RGB(0xFF, 0x33, 0x33));
+    RECT clrR = cacheBtn; clrR.right -= 8; clrR.left = clrR.right - 64;
+    DrawTextW(hdc, L"Clear", -1, &clrR, DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+
+    // About section (pushed down)
+    int aboutY = cbY + 40;
     HPEN abSep = CreatePen(PS_SOLID, 1, COL_TEXT_DIM);
     HPEN oabSep = (HPEN)SelectObject(hdc, abSep);
     MoveToEx(hdc, px + 12, aboutY, NULL); LineTo(hdc, px + pw - 12, aboutY);
@@ -2209,19 +2533,18 @@ static void DrawSliderGDI(HDC hdc, int x, int y, int w, int h, float pct) {
 }
 
 static void DrawSpeakerIcon(HDC hdc, int x, int y, int sz, int vol, bool muted) {
-    HPEN hp=CreatePen(PS_SOLID,1,COL_TEXT);
+    HPEN hp=CreatePen(PS_SOLID, max(1,sz/10), COL_TEXT);
     HPEN old=(HPEN)SelectObject(hdc,hp);
     SelectObject(hdc,GetStockObject(NULL_BRUSH));
     int cx=x+sz/2, cy=y+sz/2;
-    int bw=sz/4, bh=sz*2/3, by=cy-bh/2, bx=x+sz/6;
+    int bw=sz/5, bh=sz*3/5, by=cy-bh/2, bx=x+sz/8;
     Rectangle(hdc,bx,by,bx+bw,by+bh);
-    int cw=sz/4, ctx=bx+bw+cw;
+    int cw=sz/4, ctx=bx+bw+cw+1;
     MoveToEx(hdc,bx+bw,by,NULL); LineTo(hdc,ctx,cy); LineTo(hdc,bx+bw,by+bh);
     if(muted||vol==0){
-        // X over speaker
-        int x1=bx, y1=by, x2=bx+bw, y2=by+bh;
-        MoveToEx(hdc,x1,y1,NULL); LineTo(hdc,x2,y2);
-        MoveToEx(hdc,x2,y1,NULL); LineTo(hdc,x1,y2);
+        int pad=sz/6;
+        MoveToEx(hdc,bx-pad,by-pad,NULL); LineTo(hdc,bx+bw+pad,by+bh+pad);
+        MoveToEx(hdc,bx+bw+pad,by-pad,NULL); LineTo(hdc,bx-pad,by+bh+pad);
     }else{
         int waves=(vol<=333)?1:(vol<=666)?2:3;
         for(int w=0;w<waves;w++){
@@ -2245,15 +2568,19 @@ static void DrawBottomBar(HDC hdc, const RECT &rc) {
     float sp=(g_maxSec>0)?(float)g_curSec/g_maxSec:0;
     DrawSliderGDI(hdc,sx,sy,sw,sh,sp);
 
-    SetBkMode(hdc,TRANSPARENT); SelectObject(hdc,g_hFont); SetTextColor(hdc,COL_TEXT);
+    SetBkMode(hdc,TRANSPARENT); SelectObject(hdc,g_hFontBold);
+    SetTextColor(hdc, g_useLightTheme ? COL_TEXT : RGB(0xFF,0xFF,0xFF));
     wchar_t cs[16],ms[16];
     int cs_sec=(int)g_curSec, hh=cs_sec/3600,mm=(cs_sec%3600)/60,ss=cs_sec%60; swprintf(cs,16,L"%02d:%02d:%02d",hh,mm,ss);
     hh=g_maxSec/3600;mm=(g_maxSec%3600)/60;ss=g_maxSec%60; swprintf(ms,16,L"%02d:%02d:%02d",hh,mm,ss);
-    RECT cR={sx,sy+sh+2,sx+80,sy+sh+18}; DrawTextW(hdc,cs,-1,&cR,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    RECT mR={sx+sw-80,sy+sh+2,sx+sw,sy+sh+18}; DrawTextW(hdc,ms,-1,&mR,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    SIZE csz, msz; GetTextExtentPoint32W(hdc,cs,(int)wcslen(cs),&csz); GetTextExtentPoint32W(hdc,ms,(int)wcslen(ms),&msz);
+    int yt=sy+sh+1, yb=sy+sh+16;
+    RECT cR={sx+4,yt,sx+csz.cx+4,yb}, mR2={sx+sw-msz.cx-4,yt,sx+sw-4,yb};
+    DrawTextW(hdc,cs,-1,&cR,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    DrawTextW(hdc,ms,-1,&mR2,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
     // Bottom buttons — drawn as GDI shapes
-    for(int i=BTN_PLAY;i<=BTN_SHUFFLE;i++){
+    for(int i=BTN_SHUFFLE;i<=BTN_NEXT;i++){
         BtnID id=(BtnID)i; RECT&b=g_btnRects[id];
         COLORREF bg; if(id==g_pressBtn)bg=RGB(0x3A,0x3A,0x3A);else if(id==g_hoverBtn)bg=RGB(0x5A,0x5A,0x5A);else bg=COL_BG_DARK;
         HBRUSH hbb=CreateSolidBrush(bg); FillRect(hdc,&b,hbb); DeleteObject(hbb);
@@ -2389,8 +2716,55 @@ static void DrawEventParticles(HDC hdc) {
     }
 }
 
+static void DrawGlassOverlay(HDC hdc, const RECT &rc) {
+    if (g_useLightTheme || !g_acrylicBlur || g_blurIntensity <= 0) return;
+    float gf = 1.0f - g_blurIntensity / 100.0f;
+    if (gf < 0.01f) return;
+    Gdiplus::Graphics gfx(hdc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    // Frosted glass white tint — stronger at glass end
+    Gdiplus::SolidBrush tintBr(Gdiplus::Color((int)(20 * gf), 255, 255, 255));
+    gfx.FillRectangle(&tintBr, rc.left, rc.top, w, h);
+    // Radial glare spots — liquid glass lighting
+    Gdiplus::SolidBrush spotBr(Gdiplus::Color((int)(15 * gf), 255, 255, 255));
+    gfx.FillEllipse(&spotBr, (Gdiplus::REAL)(rc.left + w * 0.1f), (Gdiplus::REAL)(rc.top + h * 0.35f),
+                    (Gdiplus::REAL)(w * 0.35f), (Gdiplus::REAL)(h * 0.2f));
+    Gdiplus::SolidBrush spotBr2(Gdiplus::Color((int)(10 * gf), 255, 255, 255));
+    gfx.FillEllipse(&spotBr2, (Gdiplus::REAL)(rc.left + w * 0.65f), (Gdiplus::REAL)(rc.top + h * 0.1f),
+                    (Gdiplus::REAL)(w * 0.25f), (Gdiplus::REAL)(h * 0.15f));
+    // Diagonal shine — soft white gradient from top-left
+    Gdiplus::LinearGradientBrush shineBr(
+        Gdiplus::PointF(0, 0),
+        Gdiplus::PointF((Gdiplus::REAL)w * 0.6f, (Gdiplus::REAL)h * 0.4f),
+        Gdiplus::Color((int)(35 * gf), 255, 255, 255),
+        Gdiplus::Color(0, 255, 255, 255));
+    Gdiplus::PointF shPts[4] = {
+        Gdiplus::PointF(0, 0), Gdiplus::PointF((Gdiplus::REAL)w, 0),
+        Gdiplus::PointF((Gdiplus::REAL)w * 0.5f, (Gdiplus::REAL)h * 0.3f), Gdiplus::PointF(0, (Gdiplus::REAL)h * 0.15f)
+    };
+    Gdiplus::GraphicsPath shinePath;
+    shinePath.AddPolygon(shPts, 4);
+    gfx.FillPath(&shineBr, &shinePath);
+    // Subtle inner highlight on top edge
+    Gdiplus::LinearGradientBrush edgeBr(
+        Gdiplus::PointF(0, 0), Gdiplus::PointF(0, 4),
+        Gdiplus::Color((int)(60 * gf), 255, 255, 255),
+        Gdiplus::Color(0, 255, 255, 255));
+    gfx.FillRectangle(&edgeBr, (Gdiplus::REAL)rc.left, (Gdiplus::REAL)rc.top, (Gdiplus::REAL)w, 4.0f);
+}
+
 static void DrawMainArea(HDC hdc, const RECT &rc) {
-    HBRUSH hb=CreateSolidBrush(COL_BG); FillRect(hdc,&rc,hb); DeleteObject(hb);
+    // Blend background: lighter at glass end, dark at blur end (dark theme only)
+    float blend = g_acrylicBlur ? (g_blurIntensity / 100.0f) : 1.0f;
+    int bgR = GetRValue(COL_BG), bgG = GetGValue(COL_BG), bgB = GetBValue(COL_BG);
+    if (!g_useLightTheme && g_acrylicBlur) {
+        int bgComp = 0x12 + (int)((0x22 - 0x12) * (1.0f - blend));
+        if (bgComp > 0x22) bgComp = 0x22;
+        bgR = bgG = bgB = bgComp;
+    }
+    HBRUSH hb = CreateSolidBrush(RGB(bgR, bgG, bgB)); FillRect(hdc, &rc, hb); DeleteObject(hb);
+    DrawGlassOverlay(hdc, rc);
 
     // Browser view: rows of [thumb] title - artist
     #define ROW_H 44
@@ -2437,6 +2811,9 @@ static void DrawMainArea(HDC hdc, const RECT &rc) {
         g_searchBox = {};
     }
 
+    // Ensure metadata for visible range + buffer
+    CacheMetaRange(g_browserScroll);
+
     // Browser loop
     for (int ri = g_browserScroll; ri < totalItems && ri < g_browserScroll + visRows + 1; ri++) {
         int i = g_searchBuf.empty() ? ri : g_filteredIndices[ri];
@@ -2475,20 +2852,36 @@ static void DrawMainArea(HDC hdc, const RECT &rc) {
         }
         std::wstring artist = (i < (int)g_songArtists.size()) ? g_songArtists[i] : L"";
         if (artist == L"Unknown artist") artist.clear();
-        RECT tR = {tr.right + 8, rowTop, rowLeft + bw, rowBot};
+        // Duration text on the right
+        wchar_t durStr[16] = {};
+        if (i < (int)g_songDurations.size() && g_songDurations[i] > 0) {
+            int d = g_songDurations[i], dm = d / 60, ds = d % 60;
+            swprintf(durStr, 16, L"%d:%02d", dm, ds);
+        }
+        int durW = 0;
+        if (durStr[0]) { SIZE ds2; GetTextExtentPoint32W(hdc, durStr, (int)wcslen(durStr), &ds2); durW = ds2.cx + 8; }
+        RECT tR = {tr.right + 8, rowTop, rowLeft + bw - durW, rowBot};
+        // When blur is active, brighten text for readability
+        COLORREF textCol = (g_acrylicBlur && g_blurIntensity > 20) ? RGB(0xFF,0xFF,0xFF) : (i == g_trackIdx ? COL_TITLE_TEXT : COL_TEXT);
         if (artist.empty()) {
-            SetTextColor(hdc, i == g_trackIdx ? COL_TITLE_TEXT : COL_TEXT);
+            SetTextColor(hdc, textCol);
             SelectObject(hdc, g_hFont);
             DrawTextW(hdc, title.c_str(), -1, &tR, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
         } else {
             RECT tt = tR; tt.bottom = rowTop + 24;
-            SetTextColor(hdc, i == g_trackIdx ? COL_TITLE_TEXT : COL_TEXT);
+            SetTextColor(hdc, textCol);
             SelectObject(hdc, g_hFontBold);
             DrawTextW(hdc, title.c_str(), -1, &tt, DT_LEFT|DT_BOTTOM|DT_SINGLELINE|DT_END_ELLIPSIS);
             RECT ta = tR; ta.top = rowTop + 24;
-            SetTextColor(hdc, COL_TEXT_DIM);
+            SetTextColor(hdc, g_acrylicBlur && g_blurIntensity > 20 ? RGB(0xDD,0xDD,0xDD) : COL_TEXT_DIM);
             SelectObject(hdc, g_hFont);
             DrawTextW(hdc, artist.c_str(), -1, &ta, DT_LEFT|DT_TOP|DT_SINGLELINE|DT_END_ELLIPSIS);
+        }
+        if (durStr[0]) {
+            RECT dr = {rowLeft + bw - durW, rowTop, rowLeft + bw, rowBot};
+            SetTextColor(hdc, COL_TEXT_DIM);
+            SelectObject(hdc, g_hFont);
+            DrawTextW(hdc, durStr, -1, &dr, DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         }
 
         iy += ROW_H;
@@ -2524,6 +2917,7 @@ static void SaveSettings() {
         v = g_useLightTheme ? 1 : 0; RegSetValueExW(hk, L"LightTheme", 0, REG_DWORD, (BYTE*)&v, 4);
         v = g_rainbowEnabled ? 1 : 0; RegSetValueExW(hk, L"RainbowTitle", 0, REG_DWORD, (BYTE*)&v, 4);
         v = g_acrylicBlur ? 1 : 0; RegSetValueExW(hk, L"AcrylicBlur", 0, REG_DWORD, (BYTE*)&v, 4);
+        v = g_blurIntensity; RegSetValueExW(hk, L"BlurIntensity", 0, REG_DWORD, (BYTE*)&v, 4);
         v = g_eqEnabled ? 1 : 0; RegSetValueExW(hk, L"EQEnabled", 0, REG_DWORD, (BYTE*)&v, 4);
         RegSetValueExW(hk, L"EQGains", 0, REG_BINARY, (BYTE*)g_eqGains, sizeof(g_eqGains));
         RegSetValueExW(hk, L"AudioDevice", 0, REG_SZ, (BYTE*)g_audioDeviceId.c_str(), (DWORD)(g_audioDeviceId.size() + 1) * 2);
@@ -2564,6 +2958,10 @@ static void LoadSettings() {
                     g_folderName = folderName;
                     g_songTitles.assign(g_playlist.size(), L"");
                     g_songArtists.assign(g_playlist.size(), L"");
+                    g_songDurations.assign(g_playlist.size(), 0);
+                    g_metaCached.assign(g_playlist.size(), false);
+                    if (!LoadMetaCache())
+                        CacheMetaRange(0);
                     for (auto *t : g_thumbs) if (t) delete t;
                     g_thumbs.assign(g_playlist.size(), NULL);
                 }
@@ -2602,6 +3000,11 @@ static void LoadSettings() {
         sz = 4;
         if (RegQueryValueExW(hk, L"AcrylicBlur", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
             g_acrylicBlur = (v != 0);
+        }
+        sz = 4;
+        if (RegQueryValueExW(hk, L"BlurIntensity", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
+            g_blurIntensity = v;
+            if (g_blurIntensity < 1 || g_blurIntensity > 100) g_blurIntensity = 50;
         }
         sz = 4;
         if (RegQueryValueExW(hk, L"EQEnabled", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
@@ -2781,7 +3184,24 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         if(PtInRect(&rbBox,pt)){g_rainbowEnabled=!g_rainbowEnabled;InvalidateRect(hWnd,NULL,TRUE);InvalidateRect(g_hWnd,NULL,TRUE);return 0;}
         // Acrylic blur toggle (rbY=332)
         RECT abBox={16,332,30,346};
-        if(PtInRect(&abBox,pt)){g_acrylicBlur=!g_acrylicBlur;SetAcrylicBlur(g_hWnd,g_acrylicBlur);InvalidateRect(hWnd,NULL,TRUE);InvalidateRect(g_hWnd,NULL,TRUE);return 0;}
+        if(PtInRect(&abBox,pt)){
+            g_acrylicBlur=!g_acrylicBlur;
+            if (!g_acrylicBlur) g_blurIntensity = 0;
+            else if (g_blurIntensity == 0) g_blurIntensity = 50;
+            SetAcrylicBlur(g_hWnd, g_acrylicBlur ? g_blurIntensity : 0);
+            InvalidateRect(hWnd,NULL,TRUE);InvalidateRect(g_hWnd,NULL,TRUE);return 0;
+        }
+        // Blur intensity slider drag
+        if (g_acrylicBlur && PtInRect(&g_blurSliderRect, pt)) {
+            g_blurSliding = true; SetCapture(hWnd);
+            float pct = (float)(pt.x - g_blurSliderRect.left) / (g_blurSliderRect.right - g_blurSliderRect.left);
+            if (pct < 0) pct = 0; if (pct > 1) pct = 1;
+            g_blurIntensity = (int)(pct * 100);
+            if (g_blurIntensity < 1) g_blurIntensity = 1;
+            if (g_blurIntensity > 100) g_blurIntensity = 100;
+            SetAcrylicBlur(g_hWnd, g_blurIntensity);
+            InvalidateRect(hWnd, NULL, TRUE); return 0;
+        }
         // Audio output dropdown button
         if(PtInRect(&g_audioDdBtn,pt)){
             HMENU hMenu=CreatePopupMenu();
@@ -2812,6 +3232,20 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             }
             return 0;
         }
+        // Load All button
+        if(PtInRect(&g_loadAllBtnRect, pt)){
+            QueueAllMeta();
+            InvalidateRect(hWnd, NULL, TRUE);
+            InvalidateRect(g_hWnd, NULL, TRUE);
+            return 0;
+        }
+        // Clear Cache button
+        if(PtInRect(&g_cacheBtnRect, pt)){
+            DeleteAllCacheFiles();
+            InvalidateRect(hWnd, NULL, TRUE);
+            InvalidateRect(g_hWnd, NULL, TRUE);
+            return 0;
+        }
         return 0;
     }
     case WM_MOUSEMOVE:{
@@ -2822,18 +3256,27 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             SetWindowPos(hWnd,NULL,nx,ny,0,0,SWP_NOSIZE|SWP_NOZORDER);
             return 0;
         }
+        if(g_blurSliding){
+            float pct=(float)(pt.x-g_blurSliderRect.left)/(g_blurSliderRect.right-g_blurSliderRect.left);
+            if(pct<0)pct=0; if(pct>1)pct=1;
+            g_blurIntensity=(int)(pct*100);
+            if(g_blurIntensity<1)g_blurIntensity=1;
+            if(g_blurIntensity>100)g_blurIntensity=100;
+            SetAcrylicBlur(g_hWnd, g_blurIntensity);
+            InvalidateRect(hWnd,NULL,TRUE); return 0;
+        }
         if(g_opacityDragX>=0){
             int osx=85, osw=200;
             float pct=(float)(pt.x-osx)/(osw-10); if(pct<0)pct=0; if(pct>1)pct=1;
             g_windowAlpha=(int)(pct*255); if(g_windowAlpha<20)g_windowAlpha=20; if(g_windowAlpha>255)g_windowAlpha=255;
             SetLayeredWindowAttributes(g_hWnd,0,g_windowAlpha,LWA_ALPHA);
-            InvalidateRect(hWnd,NULL,TRUE);
         }
         return 0;
     }
     case WM_LBUTTONUP:{
         if(s_dragging){s_dragging=false;ReleaseCapture();}
-        if(g_opacityDragX>=0){g_opacityDragX=-1;ReleaseCapture();}
+        if(g_blurSliding){g_blurSliding=false;ReleaseCapture();InvalidateRect(g_hWnd,NULL,TRUE);}
+        if(g_opacityDragX>=0){g_opacityDragX=-1;ReleaseCapture();InvalidateRect(hWnd,NULL,TRUE);}
         return 0;
     }
     case WM_CLOSE:
@@ -3179,16 +3622,31 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                    wcscmp(ext,L".ogg")==0||wcscmp(ext,L".aac")==0||wcscmp(ext,L".m4a")==0||
                    wcscmp(ext,L".wma")==0||wcscmp(ext,L".opus")==0){
                     g_playlist.push_back(buf);
+                    g_songTitles.push_back(L"");
+                    g_songArtists.push_back(L"");
+                    g_songDurations.push_back(0);
+                    g_metaCached.push_back(false);
+                    g_thumbs.push_back(NULL);
                 }
             }
         }
         DragFinish(hDrop);
+        CacheMetaRange((int)g_playlist.size() - count / 2);
         if(count>0&&!g_playing) PlayTrack(0,false);
         else InvalidateRect(hWnd,NULL,TRUE);
         break;
     }
 
     case WM_DESTROY:
+        g_metaThreadRun = false;
+        if (g_hMetaWakeEvent) SetEvent(g_hMetaWakeEvent);
+        if (g_hMetaThread) {
+            if (WaitForSingleObject(g_hMetaThread, 500) != WAIT_OBJECT_0)
+                TerminateThread(g_hMetaThread, 0);
+            CloseHandle(g_hMetaThread); g_hMetaThread = NULL;
+        }
+        if (g_hMetaWakeEvent) { CloseHandle(g_hMetaWakeEvent); g_hMetaWakeEvent = NULL; }
+        DeleteCriticalSection(&g_metaCS);
         RemoveTrayIcon();
         SaveSettings();
         if(g_hEqWnd){DestroyWindow(g_hEqWnd);g_hEqWnd=NULL;}
@@ -3255,7 +3713,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CHAR:{
         if (!g_hasFolder || g_playlist.empty()) break;
         DWORD now = GetTickCount();
-        if (now - g_searchTick > 1500) { g_searchBuf.clear(); g_filteredIndices.clear(); }
         g_searchTick = now;
         g_searchFocused = true;
         if (wParam == VK_BACK) {
@@ -3268,7 +3725,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else break;
         UpdateFilter();
         if (!g_searchBuf.empty() && !g_filteredIndices.empty()) {
-            g_trackIdx = g_filteredIndices[0];
             InvalidateRect(hWnd, NULL, TRUE);
         } else if (g_searchBuf.empty()) {
             InvalidateRect(hWnd, NULL, TRUE);
@@ -3278,7 +3734,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_LBUTTONDOWN:{
         POINT pt={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
-        g_searchFocused = false;
+        if (!PtInBtn(pt,BTN_SEARCH)) g_searchFocused = false;
 
         // Compact mode — handle everything first before title bar checks
         if(g_compactMode){
@@ -3325,7 +3781,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
 
-        if(pt.y<TITLE_H && !PtInBtn(pt,BTN_CLOSE) && !PtInBtn(pt,BTN_MAXIMIZE) && !PtInBtn(pt,BTN_MINIMIZE) && !PtInBtn(pt,BTN_WIDGET) && !PtInBtn(pt,BTN_EQ)){
+        if(pt.y<TITLE_H && !PtInBtn(pt,BTN_CLOSE) && !PtInBtn(pt,BTN_MAXIMIZE) && !PtInBtn(pt,BTN_MINIMIZE) && !PtInBtn(pt,BTN_WIDGET) && !PtInBtn(pt,BTN_EQ) && !PtInBtn(pt,BTN_SEARCH)){
             g_dragging=true; g_dragPt=pt; SetCapture(hWnd); break;
         }
         if(PtInBtn(pt,BTN_CLOSE)){PostMessage(hWnd,WM_CLOSE,0,0);break;}
@@ -3359,6 +3815,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
+        if(PtInBtn(pt,BTN_SEARCH)){
+            if (g_searchFocused) {
+                g_searchFocused = false; g_searchBuf.clear(); g_filteredIndices.clear();
+            } else {
+                g_searchFocused = true; SetFocus(hWnd);
+            }
+            InvalidateRect(hWnd, NULL, TRUE);
+            break;
+        }
 
         // Resize grip
         if(pt.x>=g_rcClient.right-RESIZE_BORDER && pt.y>=g_rcClient.bottom-RESIZE_BORDER){
@@ -3389,7 +3854,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         // Bottom buttons
         g_pressBtn=BTN_NONE;
-        for(int i=BTN_PLAY;i<=BTN_SHUFFLE;i++) if(PtInBtn(pt,(BtnID)i)){g_pressBtn=(BtnID)i;InvalidateRect(hWnd,NULL,TRUE);break;}
+        for(int i=BTN_SHUFFLE;i<=BTN_VOLUME;i++) if(PtInBtn(pt,(BtnID)i)){g_pressBtn=(BtnID)i;InvalidateRect(hWnd,NULL,TRUE);break;}
         if(PtInBtn(pt,BTN_VOLUME)){g_pressBtn=BTN_VOLUME;InvalidateRect(hWnd,NULL,TRUE);}
         if(PtInBtn(pt,BTN_SETTINGS)){g_pressBtn=BTN_SETTINGS;InvalidateRect(hWnd,NULL,TRUE);}
         if(PtInBtn(pt,BTN_LOCATE)){g_pressBtn=BTN_LOCATE;InvalidateRect(hWnd,NULL,TRUE);}
@@ -3429,6 +3894,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_browserScroll = (int)(pct * maxSc);
                     if (g_browserScroll < 0) g_browserScroll = 0;
                     if (g_browserScroll > maxSc) g_browserScroll = maxSc;
+                    CacheMetaRange(g_browserScroll);
                     g_bDragScroll = true;
                     SetCapture(hWnd);
                     InvalidateRect(hWnd, NULL, TRUE);
@@ -3489,7 +3955,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         BtnID old=g_hoverBtn; g_hoverBtn=BTN_NONE;
-        for(int i=BTN_PLAY;i<BTN_LAST;i++) if(PtInBtn(pt,(BtnID)i)){g_hoverBtn=(BtnID)i;break;}
+        for(int i=BTN_SHUFFLE;i<BTN_LAST;i++) if(PtInBtn(pt,(BtnID)i)){g_hoverBtn=(BtnID)i;break;}
         if(old!=g_hoverBtn) InvalidateRect(hWnd,NULL,TRUE);
         g_mousePt = pt;
         bool onR=pt.x>=g_rcClient.right-RESIZE_BORDER && pt.y>=g_rcClient.bottom-RESIZE_BORDER;
@@ -3522,8 +3988,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     else if(idx==g_trackIdx){StopAudio();g_trackIdx=-1;}
                     if(idx<(int)g_songTitles.size())g_songTitles.erase(g_songTitles.begin()+idx);
                     if(idx<(int)g_songArtists.size())g_songArtists.erase(g_songArtists.begin()+idx);
+                    if(idx<(int)g_songDurations.size())g_songDurations.erase(g_songDurations.begin()+idx);
+                    if(idx<(int)g_metaCached.size())g_metaCached.erase(g_metaCached.begin()+idx);
                     if(idx<(int)g_thumbs.size()){delete g_thumbs[idx];g_thumbs.erase(g_thumbs.begin()+idx);}
                     if(g_playlist.empty())g_trackIdx=-1;
+                    if (!g_searchBuf.empty()) UpdateFilter();
                     int totalItems=(int)g_playlist.size();
                     int brH = g_rcClient.bottom - BOTTOM_H - TITLE_H - PADDING*2;
                     int visRows = brH / 44;
@@ -3554,7 +4023,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if(g_dragSeek){g_dragSeek=false;ReleaseCapture();if((g_pReader||g_useVorbis)&&g_maxSec>0) SeekTo((double)g_curSec);}
         if(g_volDragX>=0){g_volDragX=-1;ReleaseCapture();}
         if(g_opacityDragX>=0){g_opacityDragX=-1;ReleaseCapture();}
-        if(g_bDragScroll){g_bDragScroll=false;ReleaseCapture();}
+        if(g_bDragScroll){g_bDragScroll=false;CacheMetaRange(g_browserScroll);ReleaseCapture();}
         if(wd)break;
 
         BtnID clicked=g_pressBtn; g_pressBtn=BTN_NONE;
@@ -3665,6 +4134,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int totalItems = g_searchBuf.empty() ? (int)g_playlist.size() : (int)g_filteredIndices.size();
             int maxSc = max(0, totalItems - (brH / 44));
             if (g_browserScroll > maxSc) g_browserScroll = maxSc;
+            CacheMetaRange(g_browserScroll);
             InvalidateRect(hWnd, NULL, TRUE);
         }
         break;
@@ -3678,7 +4148,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else g_curSec = g_lastSamplePos / 10000000.0;
         }
         if(!g_playing) g_rainbowTick = 0;
-        if(now - g_searchTick > 1500 && !g_searchBuf.empty()) { g_searchBuf.clear(); g_filteredIndices.clear(); g_searchFocused = false; }
         UpdateEventParticles();
         if(now - s_lastThumbs >= 250) {
             s_lastThumbs = now;
@@ -3687,6 +4156,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(g_hWnd,NULL,TRUE);
         break;
     }
+
+    case WM_APP:
+        InvalidateRect(hWnd, NULL, TRUE);
+        return 0;
+    case WM_APP + 1:
+        SaveMetaCache();
+        return 0;
 
     default: return DefWindowProcW(hWnd,msg,wParam,lParam);
     }
@@ -3753,9 +4229,11 @@ static void DrawCompactMode(HDC hdc, const RECT &rc) {
     int gcs=(int)g_curSec, min = gcs/60, sec = gcs%60;
     int tmin = g_maxSec/60, tsec = g_maxSec%60;
     swprintf(tbuf, 32, L"%d:%02d / %d:%02d", min, sec, tmin, tsec);
-    SetTextColor(hdc, RGB(0xAA,0xAA,0xCC));
-    RECT tmR = {0, 44, rc.right, 64};
-    DrawTextW(hdc, tbuf, -1, &tmR, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    SetTextColor(hdc, g_useLightTheme ? COL_TEXT : RGB(0xFF,0xFF,0xFF));
+    SelectObject(hdc,g_hFontBold);
+    SIZE tsz; GetTextExtentPoint32W(hdc,tbuf,(int)wcslen(tbuf),&tsz);
+    RECT tmR={(rc.right-tsz.cx)/2,44,(rc.right+tsz.cx)/2,64};
+    DrawTextW(hdc,tbuf,-1,&tmR,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
     // Control buttons
     int bw = 40, bh = 32, gap = 8, total = bw * 5 + gap * 4;
@@ -3816,7 +4294,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     g_hSettingsWnd=CreateWindowExW(0,L"LiteSettings",L"Settings",
         WS_POPUP,
-        CW_USEDEFAULT,CW_USEDEFAULT,300,500,
+        CW_USEDEFAULT,CW_USEDEFAULT,300,560,
         hWnd,NULL,hInstance,NULL);
 
     g_hEqWnd=CreateWindowExW(0,L"LiteEQ",L"Equalizer",
@@ -3826,9 +4304,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     LoadSettings();
     EnumerateAudioDevices();
-    SetAcrylicBlur(hWnd, g_acrylicBlur);
+    SetAcrylicBlur(hWnd, g_acrylicBlur ? g_blurIntensity : 0);
     InitSMTC(hWnd);
     InitTrayIcon(hWnd);
+
+    // Start background metadata scanning thread
+    InitializeCriticalSection(&g_metaCS);
+    g_hMetaWakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_metaThreadRun = true;
+    g_hMetaThread = CreateThread(NULL, 0, MetaThreadProc, NULL, 0, NULL);
 
     ShowWindow(hWnd,nCmdShow);
     UpdateWindow(hWnd);
