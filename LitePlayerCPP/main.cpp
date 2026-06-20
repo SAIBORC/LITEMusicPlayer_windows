@@ -476,7 +476,7 @@ static void InitTooltips() {
     g_btnTooltips[BTN_PREV]     = L"Previous";
     g_btnTooltips[BTN_NEXT]     = L"Next";
     g_btnTooltips[BTN_SHUFFLE]  = L"Repeat: Off / Once / All";
-    g_btnTooltips[BTN_VOLUME]   = L"Volume";
+    g_btnTooltips[BTN_VOLUME]   = L"Volume (click to mute)";
     g_btnTooltips[BTN_SETTINGS] = L"Settings";
     g_btnTooltips[BTN_LOCATE]   = L"Locate Current Track";
     g_btnTooltips[BTN_EQ]       = L"Equalizer";
@@ -1451,6 +1451,24 @@ static void PlayFile(const wchar_t *path, bool userStop) {
     g_audioFrameSize = wfx.nBlockAlign;
     g_eqSampleRate = wfx.nSamplesPerSec;
     if (g_eqEnabled) CalcEQCoeffs(g_eqSampleRate);
+    // If the output format differs from the source, reconfigure MF reader to convert
+    if (wfx.nSamplesPerSec != sr || wfx.nChannels != ch) {
+        IMFMediaType *pNewMT = NULL;
+        if (SUCCEEDED(MFCreateMediaType(&pNewMT))) {
+            pNewMT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            pNewMT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+            pNewMT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, wfx.nSamplesPerSec);
+            pNewMT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, wfx.nChannels);
+            pNewMT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            pNewMT->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, wfx.nBlockAlign);
+            pNewMT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, wfx.nAvgBytesPerSec);
+            if (SUCCEEDED(g_pReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, NULL, pNewMT))) {
+                sr = wfx.nSamplesPerSec;
+                ch = wfx.nChannels;
+            }
+            pNewMT->Release();
+        }
+    }
     g_pAudioClient->GetBufferSize(&g_audioBufFrames);
     g_pAudioClient->GetService(__uuidof(IAudioRenderClient),(void**)&g_pRenderClient);
     g_pAudioClient->GetService(__uuidof(ISimpleAudioVolume),(void**)&g_pSimpleVol);
@@ -2265,21 +2283,17 @@ static void DrawBottomBar(HDC hdc, const RECT &rc) {
         }
     }
 
-    // Mute button
-    RECT&mb=g_btnRects[BTN_MUTE];
-    { COLORREF bg; if(BTN_MUTE==g_pressBtn)bg=RGB(0x3A,0x3A,0x3A);else if(BTN_MUTE==g_hoverBtn)bg=RGB(0x5A,0x5A,0x5A);else bg=COL_BG_DARK;
-      HBRUSH hbb=CreateSolidBrush(bg); FillRect(hdc,&mb,hbb); DeleteObject(hbb);
-      if(BTN_MUTE==g_hoverBtn||BTN_MUTE==g_pressBtn){
+    // Volume icon + slider  (click icon to toggle mute)
+    RECT&vb=g_btnRects[BTN_VOLUME];
+    { COLORREF bg; if(BTN_VOLUME==g_pressBtn)bg=RGB(0x3A,0x3A,0x3A);else if(BTN_VOLUME==g_hoverBtn)bg=RGB(0x5A,0x5A,0x5A);else bg=COL_BG_DARK;
+      HBRUSH hbb=CreateSolidBrush(bg); FillRect(hdc,&vb,hbb); DeleteObject(hbb);
+      if(BTN_VOLUME==g_hoverBtn||BTN_VOLUME==g_pressBtn){
           HPEN hp=CreatePen(PS_SOLID,1,COL_TEXT_DIM); HPEN old=(HPEN)SelectObject(hdc,hp);
-          SelectObject(hdc,GetStockObject(NULL_BRUSH)); Rectangle(hdc,mb.left,mb.top,mb.right,mb.bottom);
+          SelectObject(hdc,GetStockObject(NULL_BRUSH)); Rectangle(hdc,vb.left,vb.top,vb.right,vb.bottom);
           SelectObject(hdc,old); DeleteObject(hp);
       }
-      DrawSpeakerIcon(hdc,mb.left+2,mb.top+2,mb.right-mb.left-4,g_muted?0:g_volume,g_muted);
+      DrawSpeakerIcon(hdc,vb.left+2,vb.top+2,vb.right-vb.left-4,g_muted?0:g_volume,g_muted);
     }
-
-    // Volume icon + slider
-    RECT&vb=g_btnRects[BTN_VOLUME];
-    DrawSpeakerIcon(hdc,vb.left+4,vb.top+4,vb.bottom-vb.top-8,g_volume,g_muted);
     int vx,vy,vw,vh; VolRect(vx,vy,vw,vh);
     DrawSliderGDI(hdc,vx,vy,vw,vh,(float)g_volume/1000.0f);
 
@@ -3376,7 +3390,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Bottom buttons
         g_pressBtn=BTN_NONE;
         for(int i=BTN_PLAY;i<=BTN_SHUFFLE;i++) if(PtInBtn(pt,(BtnID)i)){g_pressBtn=(BtnID)i;InvalidateRect(hWnd,NULL,TRUE);break;}
-        if(PtInBtn(pt,BTN_MUTE)){g_pressBtn=BTN_MUTE;InvalidateRect(hWnd,NULL,TRUE);}
+        if(PtInBtn(pt,BTN_VOLUME)){g_pressBtn=BTN_VOLUME;InvalidateRect(hWnd,NULL,TRUE);}
         if(PtInBtn(pt,BTN_SETTINGS)){g_pressBtn=BTN_SETTINGS;InvalidateRect(hWnd,NULL,TRUE);}
         if(PtInBtn(pt,BTN_LOCATE)){g_pressBtn=BTN_LOCATE;InvalidateRect(hWnd,NULL,TRUE);}
 
@@ -3505,10 +3519,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 else if(cmd==102){
                     g_playlist.erase(g_playlist.begin()+idx);
                     if(idx<g_trackIdx)g_trackIdx--;
-                    else if(idx==g_trackIdx){StopAudio();}
+                    else if(idx==g_trackIdx){StopAudio();g_trackIdx=-1;}
                     if(idx<(int)g_songTitles.size())g_songTitles.erase(g_songTitles.begin()+idx);
                     if(idx<(int)g_songArtists.size())g_songArtists.erase(g_songArtists.begin()+idx);
+                    if(idx<(int)g_thumbs.size()){delete g_thumbs[idx];g_thumbs.erase(g_thumbs.begin()+idx);}
                     if(g_playlist.empty())g_trackIdx=-1;
+                    int totalItems=(int)g_playlist.size();
+                    int brH = g_rcClient.bottom - BOTTOM_H - TITLE_H - PADDING*2;
+                    int visRows = brH / 44;
+                    int maxSc = max(0, totalItems - visRows);
+                    if(g_browserScroll>maxSc)g_browserScroll=maxSc;
                     InvalidateRect(hWnd,NULL,TRUE);
                 }else if(cmd==103){
                     std::wstring params = L"/select,\"" + g_playlist[idx] + L"\"";
@@ -3558,7 +3578,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ShowWindow(g_hSettingsWnd,SW_SHOW);
                     SetForegroundWindow(g_hSettingsWnd);
                 } break;
-            case BTN_MUTE:
+            case BTN_VOLUME:
                 g_muted=!g_muted;
                 if(g_muted){g_prevVolume=g_volume;g_volume=0;if(g_pSimpleVol)g_pSimpleVol->SetMasterVolume(0,NULL);}
                 else{g_volume=g_prevVolume;if(g_pSimpleVol)g_pSimpleVol->SetMasterVolume(g_volume/1000.0f,NULL);}
