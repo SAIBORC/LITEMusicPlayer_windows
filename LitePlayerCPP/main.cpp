@@ -52,8 +52,12 @@
 #include "resource.h"
 #include "stb_vorbis.h"
 
+// Window opacity (acrylic blur works best at full opacity).
+static int            g_windowAlpha   = 255;
+
 // ---------------------------------------------------------------------------
-// Acrylic blur for title bar
+// Acrylic blur — shows blurred content from behind the window (macOS glass style)
+// Uses SetWindowCompositionAttribute with ACCENT_ENABLE_ACRYLICBLUR
 // ---------------------------------------------------------------------------
 struct ACCENTPOLICY { DWORD state; DWORD flags; DWORD color; DWORD animId; };
 struct WINCOMPATTR { DWORD attrib; void *data; ULONG dataSize; };
@@ -65,18 +69,21 @@ static void InitWCA() {
         if (h) s_wca = (WCAFunc)GetProcAddress(h, "SetWindowCompositionAttribute");
     }
 }
-static void SetAcrylicBlur(HWND hw, int intensity) {
+static void SetGlassBlur(HWND hw, int intensity) {
     InitWCA();
     if (!s_wca) return;
     ACCENTPOLICY ap = {};
-    WINCOMPATTR wc = {19, &ap, sizeof(ap)};
+    WINCOMPATTR wc = {19, &ap, sizeof(ap)}; // 19 = WCA_ACCENT_POLICY
     if (intensity > 0) {
-        ap.state = 4;
+        ap.state = 4; // ACCENT_ENABLE_ACRYLICBLUR
         int a = intensity * 180 / 100;
         if (a > 180) a = 180;
-        // Blend base color from light (glass) to dark (blur)
+        // Tint color: light glass at low intensity -> dark blur at high intensity
         int c = 0xE0 - (intensity * 0xC8 / 100);
+        if (c < 0x20) c = 0x20;
         ap.color = (DWORD)((a << 24) | (c << 16) | (c << 8) | c);
+    } else {
+        ap.state = 0; // ACCENT_DISABLED
     }
     s_wca(hw, &wc);
 }
@@ -96,8 +103,6 @@ static COLORREF       g_sliderFill    = RGB(0x1D,0xB9,0x54);
 static COLORREF       COL_SLIDER_THUMB= RGB(0xEE,0xEE,0xEE);
 static COLORREF       COL_LIST_BG     = RGB(0x0D,0x0D,0x0D);
 static COLORREF       COL_ART_BG      = RGB(0x1E,0x1E,0x1E);
-static int            g_windowAlpha   = 255;
-
 static int            g_rainbowTick   = 0;
 static bool           g_rainbowEnabled = true;
 static bool           g_acrylicBlur    = true;
@@ -107,7 +112,21 @@ static RECT           g_blurSliderRect = {};
 static int            g_manualEvent    = -1;
 static bool           g_useLightTheme = false;
 static RECT           g_cacheBtnRect = {};
+
+// Rainbow title fade-in / fade-out animation alpha (0..255)
+static BYTE           g_rainbowAlpha   = 0;
+
+// Customizability options
+static bool           g_minimizeToTray = false; // hide to tray on minimize instead of taskbar
+static bool           g_startCompact   = false; // start in compact (cat) mode
+
+// Redraw-change tracking (keeps timer from invalidating every frame when nothing moved)
+static double         g_lastPosSec      = -1.0;
+static bool           g_lastPlaying     = false;
+static bool           g_lastPaused      = false;
 static RECT           g_loadAllBtnRect = {};
+static RECT           g_trayChkRect = {};
+static RECT           g_startCompactRect = {};
 
 // Audio output device selection (empty = default system device)
 static std::vector<std::wstring> g_audioDeviceNames; // display names for dropdown
@@ -136,6 +155,48 @@ static const COLORREF g_accentColors[] = {
 static const int g_accentColorCount = sizeof(g_accentColors) / sizeof(g_accentColors[0]);
 static COLORREF g_custColors[16] = {};
 static RECT g_customBtnRect = {};
+
+// ---------------------------------------------------------------------------
+// Cached GDI+ resources for smooth 60fps rendering
+// ---------------------------------------------------------------------------
+static Gdiplus::Bitmap *g_rainbowBmp = NULL;      // cached rainbow title bar
+static int g_rainbowBmpW = 0;                      // cached width
+static bool g_rainbowBmpDirty = true;              // force rebuild on next paint
+static Gdiplus::Bitmap *g_glassBmp = NULL;         // cached glass overlay
+static int g_glassBmpW = 0, g_glassBmpH = 0;       // cached glass size
+static int g_glassBmpIntensity = -1;               // last intensity cached
+static bool g_glassBmpDirty = true;                // force rebuild on next paint
+
+// Persistent backbuffer for double-buffered drawing (recreated only on resize)
+static HDC   g_backDC    = NULL;
+static HBITMAP g_backBM  = NULL;
+static HBITMAP g_backOld = NULL;
+static int   g_backW = 0, g_backH = 0;
+
+static void EnsureBackbuffer(HDC screenDC, int w, int h) {
+    if (w <= 0 || h <= 0) return; // safety: don't create invalid bitmaps
+    if (g_backDC && g_backW == w && g_backH == h) return;
+    if (g_backDC) {
+        SelectObject(g_backDC, g_backOld);
+        DeleteObject(g_backBM);
+        DeleteDC(g_backDC);
+        g_backDC = NULL; g_backBM = NULL; g_backOld = NULL;
+    }
+    g_backDC = CreateCompatibleDC(screenDC);
+    g_backBM = CreateCompatibleBitmap(screenDC, w, h);
+    g_backOld = (HBITMAP)SelectObject(g_backDC, g_backBM);
+    g_backW = w; g_backH = h;
+}
+
+static void DestroyBackbuffer() {
+    if (g_backDC) {
+        SelectObject(g_backDC, g_backOld);
+        DeleteObject(g_backBM);
+        DeleteDC(g_backDC);
+        g_backDC = NULL; g_backBM = NULL; g_backOld = NULL;
+        g_backW = 0; g_backH = 0;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SMTC (SystemMediaTransportControls) COM interface definitions
@@ -362,6 +423,7 @@ static std::vector<Gdiplus::Image*> g_thumbs;
 static int g_browserScroll = 0;
 static std::vector<int> g_filteredIndices;
 static RECT g_searchBox = {};
+static RECT g_searchClearBtn = {};
 static bool g_searchFocused = false;
 
 // Button tracking
@@ -526,6 +588,8 @@ static void ApplyEQ(short *samples, int frames, int channels);
 #define VIZ_MASK (VIZ_BARS-1)
 static float g_vizRing[VIZ_BARS] = {};
 static int g_vizHead = 0;
+static HBRUSH g_vizBrush = NULL;
+static COLORREF g_vizBrushColor = RGB(0,0,0);
 static void VizPush(float peak) {
     g_vizRing[g_vizHead] = peak;
     g_vizHead = (g_vizHead + 1) & VIZ_MASK;
@@ -533,6 +597,12 @@ static void VizPush(float peak) {
 static void DrawVisualizer(HDC hdc, int x, int y, int w, int h) {
     if (w < 20 || h < 4) return;
     SetBkMode(hdc, TRANSPARENT);
+    // Cache visualizer brush — recreate only when accent color changes
+    if (g_vizBrush == NULL || g_vizBrushColor != g_accentColor) {
+        if (g_vizBrush) DeleteObject(g_vizBrush);
+        g_vizBrush = CreateSolidBrush(g_accentColor);
+        g_vizBrushColor = g_accentColor;
+    }
     float barW = (float)w / VIZ_BARS;
     for (int i = 0; i < VIZ_BARS; i++) {
         int idx = (g_vizHead - 1 - i) & VIZ_MASK;
@@ -542,8 +612,7 @@ static void DrawVisualizer(HDC hdc, int x, int y, int w, int h) {
         if (barH < 1 && val > 0) barH = 1;
         int bx = x + (int)((VIZ_BARS-1-i) * barW);
         RECT br = {bx, y + h - barH, bx + (int)barW - 1, y + h};
-        HBRUSH bb = CreateSolidBrush(g_accentColor);
-        FillRect(hdc, &br, bb); DeleteObject(bb);
+        FillRect(hdc, &br, g_vizBrush);
     }
 }
 
@@ -666,6 +735,16 @@ static void UpdateSMTC() {
 
     updater->put_Type(SMTC_Music);
 
+    // App media ID — ties the session to this app for the Quick Settings panel
+    std::wstring mediaId = L"LITE.MusicPlayer";
+    if (g_trackIdx >= 0 && g_trackIdx < (int)g_playlist.size())
+        mediaId += L"|" + g_playlist[g_trackIdx];
+    HSTRING hMediaId = NULL;
+    if (SUCCEEDED(WindowsCreateString(mediaId.c_str(), (UINT32)mediaId.size(), &hMediaId))) {
+        updater->put_AppMediaId(hMediaId);
+        WindowsDeleteString(hMediaId);
+    }
+
     IMusicDisplayProperties *music = NULL;
     if (SUCCEEDED(updater->get_MusicProperties((void**)&music))) {
         const wchar_t *title = g_songTitle.empty() ? L"Unknown Track" : g_songTitle.c_str();
@@ -690,10 +769,13 @@ static void UpdateSMTC() {
 static void CalcLayout(const RECT &rc) {
     int w = rc.right - rc.left;
     int bh = BOTTOM_H;
-    int bw = (w < 600) ? 22 : 28;
+    int bw = 28; // uniform button size so all control icons are the same size
     int bgap = 4;
     int by = rc.bottom - bh + (bh - bw) / 2 + 4;
-    int cx = PADDING + 85;
+
+    // Bottom control buttons — centered as a group
+    int totalBtnW = bw * 8 + bgap * 3 + 8 * 3; // 8 buttons + gaps + extra spacing
+    int cx = PADDING + 85 + max(0, (w - PADDING * 2 - 170 - totalBtnW) / 2);
     SetRect(&g_btnRects[BTN_SHUFFLE],  cx,   by,  cx+bw,   by+bw);   cx += bw+bgap;
     SetRect(&g_btnRects[BTN_STOP],     cx,   by,  cx+bw,   by+bw);   cx += bw+bgap+8;
     SetRect(&g_btnRects[BTN_PREV],     cx,   by,  cx+bw,   by+bw);   cx += bw+bgap;
@@ -1933,46 +2015,268 @@ static void ApplyEQ(short *samples, int frames, int channels) {
 }
 
 // ---------------------------------------------------------------------------
-// Drawing helpers
+// Modern uniform icons (GDI+ drawn, same size for every control)
 // ---------------------------------------------------------------------------
-static void DrawBtnShape(HDC hdc, RECT r, int shape) {
-    HPEN hp=CreatePen(PS_SOLID,1,COL_TEXT);
-    HPEN old=(HPEN)SelectObject(hdc,hp);
-    HBRUSH hb=CreateSolidBrush(COL_TEXT);
-    HBRUSH ob=(HBRUSH)SelectObject(hdc,hb);
+enum IconType {
+    ICON_PLAY, ICON_PAUSE, ICON_STOP, ICON_PREV, ICON_NEXT,
+    ICON_SHUFFLE, ICON_SETTINGS, ICON_LOCATE, ICON_VOLUME, ICON_VOLUME_MUTE,
+    ICON_SEARCH, ICON_EQ, ICON_WIDGET, ICON_MINIMIZE, ICON_MAXIMIZE, ICON_CLOSE
+};
 
-    int cx=(r.left+r.right)/2, cy=(r.top+r.bottom)/2;
-    int hs=(r.right-r.left)/3;
-    if (hs<4) hs=4;
+// ---------------------------------------------------------------------------
+// Cached button icon bitmaps (render once as white masks, tint at draw time)
+// ---------------------------------------------------------------------------
+static Gdiplus::Bitmap *g_iconMask[16] = {NULL};     // white icon mask per IconType
+static int g_iconMaskSize[16] = {0};                  // size each was rendered at
 
-    if (shape==0) { // play triangle (right-pointing)
-        POINT pts[3]={{cx-hs/2,cy-hs},{cx-hs/2,cy+hs},{cx+hs,cy}};
-        Polygon(hdc,pts,3);
-    } else if (shape==1) { // pause (two vertical bars)
-        int bw = hs/2;
-        RECT b1 = {cx - bw - 2, cy - hs + 2, cx - 2, cy + hs - 2};
-        RECT b2 = {cx + 2, cy - hs + 2, cx + bw + 2, cy + hs - 2};
-        FillRect(hdc, &b1, hb); FillRect(hdc, &b2, hb);
-    } else if (shape==2) { // stop (filled square)
-        int s2 = hs;
-        RECT sr={cx-s2,cy-s2,cx+s2,cy+s2};
-        FillRect(hdc,&sr,hb);
-    } else if (shape==3) { // prev (left-pointing triangle + bar)
-        int third = hs/2;
-        RECT bar = {cx - hs - 2, cy - hs, cx - hs, cy + hs};
-        FillRect(hdc, &bar, hb);
-        POINT pts[3]={{cx+third+2,cy-hs},{cx+third+2,cy+hs},{cx-hs-2,cy}};
-        Polygon(hdc,pts,3);
-    } else if (shape==4) { // next (right-pointing triangle + bar)
-        int third = hs/2;
-        RECT bar = {cx + hs, cy - hs, cx + hs + 2, cy + hs};
-        FillRect(hdc, &bar, hb);
-        POINT pts[3]={{cx-third-2,cy-hs},{cx-third-2,cy+hs},{cx+hs+2,cy}};
-        Polygon(hdc,pts,3);
+static void DrawModernIcon(Gdiplus::Graphics &g, IconType icon, float cx, float cy, int size, Gdiplus::Color color, bool pressed); // forward decl
+
+static Gdiplus::Bitmap *GetIconMask(IconType icon, int size) {
+    if (g_iconMask[(int)icon] == NULL || g_iconMaskSize[(int)icon] != size) {
+        if (g_iconMask[(int)icon]) { delete g_iconMask[(int)icon]; g_iconMask[(int)icon] = NULL; }
+        g_iconMask[(int)icon] = new Gdiplus::Bitmap(size, size, PixelFormat32bppPARGB);
+        g_iconMaskSize[(int)icon] = size;
+        Gdiplus::Graphics ib(g_iconMask[(int)icon]);
+        ib.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        DrawModernIcon(ib, icon, (float)size / 2.f, (float)size / 2.f, size, Gdiplus::Color(255, 255, 255, 255), false);
     }
+    return g_iconMask[(int)icon];
+}
 
-    SelectObject(hdc,ob); DeleteObject(hb);
-    SelectObject(hdc,old); DeleteObject(hp);
+static void ClearIconCache() {
+    for (int i = 0; i < 16; i++) {
+        if (g_iconMask[i]) { delete g_iconMask[i]; g_iconMask[i] = NULL; }
+        g_iconMaskSize[i] = 0;
+    }
+}
+
+static void DrawModernIcon(Gdiplus::Graphics &g, IconType icon, float cx, float cy, int size, Gdiplus::Color color, bool pressed) {
+    Gdiplus::Pen pen(color, (float)(size * 0.09f));
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    pen.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound, Gdiplus::DashCapRound);
+    Gdiplus::SolidBrush brush(color);
+    float s = (float)size * 0.52f;  // icon scale relative to button (fits with padding)
+
+    auto push = [&](Gdiplus::GraphicsPath &path) {
+        g.DrawPath(&pen, &path);
+        if (pressed) {
+            Gdiplus::Pen glowPen(Gdiplus::Color(100, color.GetR(), color.GetG(), color.GetB()), (float)(size * 0.14f));
+            glowPen.SetLineJoin(Gdiplus::LineJoinRound);
+            g.DrawPath(&glowPen, &path);
+        }
+    };
+
+    switch (icon) {
+    case ICON_PLAY: {
+        Gdiplus::GraphicsPath path;
+        path.AddLine(cx - s * 0.42f, cy - s * 0.55f, cx - s * 0.42f, cy + s * 0.55f);
+        path.AddLine(cx - s * 0.42f, cy + s * 0.55f, cx + s * 0.5f, cy);
+        path.AddLine(cx + s * 0.5f, cy, cx - s * 0.42f, cy - s * 0.55f);
+        path.CloseFigure();
+        g.FillPath(&brush, &path);
+        break;
+    }
+    case ICON_PAUSE: {
+        float bw = s * 0.2f, bh = s * 0.55f, gap = s * 0.1f;
+        Gdiplus::GraphicsPath path;
+        path.AddRectangle(Gdiplus::RectF(cx - bw - gap, cy - bh, bw, bh * 2));
+        path.AddRectangle(Gdiplus::RectF(cx + gap, cy - bh, bw, bh * 2));
+        g.FillPath(&brush, &path);
+        break;
+    }
+    case ICON_STOP: {
+        Gdiplus::GraphicsPath path;
+        path.AddRectangle(Gdiplus::RectF(cx - s * 0.38f, cy - s * 0.38f, s * 0.76f, s * 0.76f));
+        g.FillPath(&brush, &path);
+        break;
+    }
+    case ICON_PREV: {
+        Gdiplus::GraphicsPath path;
+        // bar (vertical line on left side of triangle)
+        path.AddRectangle(Gdiplus::RectF(cx - s * 0.5f, cy - s * 0.5f, s * 0.11f, s));
+        // triangle pointing left
+        path.AddLine(cx + s * 0.18f, cy - s * 0.5f, cx + s * 0.18f, cy + s * 0.5f);
+        path.AddLine(cx + s * 0.18f, cy + s * 0.5f, cx - s * 0.32f, cy);
+        path.AddLine(cx - s * 0.32f, cy, cx + s * 0.18f, cy - s * 0.5f);
+        path.CloseFigure();
+        g.FillPath(&brush, &path);
+        break;
+    }
+    case ICON_NEXT: {
+        Gdiplus::GraphicsPath path;
+        // bar (vertical line on right side of triangle)
+        path.AddRectangle(Gdiplus::RectF(cx + s * 0.39f, cy - s * 0.5f, s * 0.11f, s));
+        // triangle pointing right
+        path.AddLine(cx - s * 0.18f, cy - s * 0.5f, cx - s * 0.18f, cy + s * 0.5f);
+        path.AddLine(cx - s * 0.18f, cy + s * 0.5f, cx + s * 0.32f, cy);
+        path.AddLine(cx + s * 0.32f, cy, cx - s * 0.18f, cy - s * 0.5f);
+        path.CloseFigure();
+        g.FillPath(&brush, &path);
+        break;
+    }
+    case ICON_SHUFFLE: {
+        Gdiplus::GraphicsPath path;
+        const wchar_t *sym = (g_repeatMode == 1) ? L"1" : (g_repeatMode == 2) ? L"R" : L">";
+        Gdiplus::FontFamily fontFamily(L"Segoe UI");
+        Gdiplus::Font font(&fontFamily, (float)(size * 0.55f), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+        Gdiplus::RectF layoutRect;
+        Gdiplus::StringFormat fmt;
+        fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
+        fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        g.MeasureString(sym, -1, &font, Gdiplus::PointF((float)cx, (float)cy), &fmt, &layoutRect);
+        Gdiplus::PointF origin((float)(cx - layoutRect.Width / 2), (float)(cy - layoutRect.Height / 2));
+        g.DrawString(sym, -1, &font, origin, &fmt, &brush);
+        break;
+    }
+    case ICON_SETTINGS: {
+        Gdiplus::GraphicsPath path;
+        float r = s * 0.42f;
+        path.AddEllipse(cx - r, cy - r, r * 2, r * 2);
+        // gear teeth (8 teeth around the circle)
+        for (int t = 0; t < 8; t++) {
+            float a = 3.14159f * 2 * t / 8;
+            float x1 = cx + cosf(a) * r * 0.75f;
+            float y1 = cy + sinf(a) * r * 0.75f;
+            float x2 = cx + cosf(a) * r * 1.0f;
+            float y2 = cy + sinf(a) * r * 1.0f;
+            path.AddLine(x1, y1, x2, y2);
+        }
+        path.AddEllipse(cx - s * 0.14f, cy - s * 0.14f, s * 0.28f, s * 0.28f);
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    case ICON_LOCATE: {
+        Gdiplus::GraphicsPath path;
+        // Map pin / location marker — circle on top, point at bottom center
+        float pinW = s * 0.34f, pinH = s * 0.42f;
+        float pinTop = cy - s * 0.28f;
+        // Top circle of pin
+        path.AddArc(cx - pinW/2, pinTop, pinW, pinH * 0.6f, 180, 360);
+        // Sides going down to point
+        path.AddLine(cx + pinW/2, pinTop + pinH * 0.3f, cx + s * 0.08f, cy + s * 0.28f);
+        path.AddLine(cx + s * 0.08f, cy + s * 0.28f, cx - s * 0.08f, cy + s * 0.28f);
+        path.AddLine(cx - s * 0.08f, cy + s * 0.28f, cx - pinW/2, pinTop + pinH * 0.3f);
+        path.AddLine(cx - pinW/2, pinTop + pinH * 0.3f, cx - pinW/2, pinTop);
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    case ICON_VOLUME: {
+        Gdiplus::GraphicsPath path;
+        // Speaker body — vertical rect on left side
+        float bodyW = s * 0.22f, bodyH = s * 0.5f;
+        path.AddRectangle(Gdiplus::RectF(cx - s * 0.35f, cy - bodyH/2, bodyW, bodyH));
+        // Speaker cone — triangle pointing right
+        path.AddLine(cx - s * 0.13f, cy - s * 0.32f, cx + s * 0.12f, cy);
+        path.AddLine(cx + s * 0.12f, cy, cx - s * 0.13f, cy + s * 0.32f);
+        path.AddLine(cx - s * 0.13f, cy + s * 0.32f, cx - s * 0.13f, cy - s * 0.32f);
+        path.CloseFigure();
+        // Sound waves — 3 arcs to the right of the cone
+        float baseX = cx + s * 0.18f;
+        for (int w = 0; w < 3; w++) {
+            float rad = s * (0.18f + w * 0.14f);
+            path.AddArc(baseX - rad, cy - rad, rad * 2, rad * 2, 0, 180);
+        }
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    case ICON_VOLUME_MUTE: {
+        Gdiplus::GraphicsPath path;
+        // Speaker body
+        float bodyW = s * 0.22f, bodyH = s * 0.5f;
+        path.AddRectangle(Gdiplus::RectF(cx - s * 0.35f, cy - bodyH/2, bodyW, bodyH));
+        // Speaker cone
+        path.AddLine(cx - s * 0.13f, cy - s * 0.32f, cx + s * 0.12f, cy);
+        path.AddLine(cx + s * 0.12f, cy, cx - s * 0.13f, cy + s * 0.32f);
+        path.AddLine(cx - s * 0.13f, cy + s * 0.32f, cx - s * 0.13f, cy - s * 0.32f);
+        path.CloseFigure();
+        // Mute slash — diagonal line through the center
+        path.AddLine(cx - s * 0.45f, cy - s * 0.45f, cx + s * 0.45f, cy + s * 0.45f);
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    case ICON_SEARCH: {
+        Gdiplus::GraphicsPath path;
+        float r = s * 0.28f;
+        path.AddArc(cx - r, cy - r, r * 2, r * 2, 0, 360);
+        path.AddLine(cx + s * 0.24f, cy + s * 0.24f, cx + s * 0.48f, cy + s * 0.48f);
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    case ICON_EQ: {
+        Gdiplus::GraphicsPath path;
+        float barW = s * 0.13f;
+        float heights[5] = {0.38f, 0.62f, 0.85f, 0.55f, 0.72f};
+        for (int i = 0; i < 5; i++) {
+            float bx = cx - s * 0.36f + i * s * 0.18f;
+            path.AddRectangle(Gdiplus::RectF(bx, cy - s * heights[i], barW, s * heights[i] * 2));
+        }
+        g.FillPath(&brush, &path);
+        break;
+    }
+    case ICON_WIDGET: {
+        Gdiplus::GraphicsPath path;
+        path.AddRectangle(Gdiplus::RectF(cx - s * 0.38f, cy - s * 0.38f, s * 0.76f, s * 0.76f));
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    case ICON_MINIMIZE: {
+        Gdiplus::GraphicsPath path;
+        path.AddLine(cx - s * 0.3f, cy, cx + s * 0.3f, cy);
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    case ICON_MAXIMIZE: {
+        Gdiplus::GraphicsPath path;
+        path.AddRectangle(Gdiplus::RectF(cx - s * 0.34f, cy - s * 0.34f, s * 0.68f, s * 0.68f));
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    case ICON_CLOSE: {
+        Gdiplus::GraphicsPath path;
+        path.AddLine(cx - s * 0.32f, cy - s * 0.32f, cx + s * 0.32f, cy + s * 0.32f);
+        path.AddLine(cx + s * 0.32f, cy - s * 0.32f, cx - s * 0.32f, cy + s * 0.32f);
+        g.DrawPath(&pen, &path);
+        break;
+    }
+    }
+}
+
+// Draw a single control button with a modern icon (uses cached white mask + ColorMatrix tint)
+static void DrawControlBtn(Gdiplus::Graphics &g, RECT r, IconType icon, COLORREF textColor, bool hover, bool press) {
+    int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+    int size = min(r.right - r.left, r.bottom - r.top);
+
+    // Button background
+    Gdiplus::Color bgCol;
+    if (press) bgCol = Gdiplus::Color(255, 0x4A, 0x4A, 0x4A);
+    else if (hover) bgCol = Gdiplus::Color(255, 0x3A, 0x3A, 0x3A);
+    else bgCol = Gdiplus::Color(0, 0, 0, 0); // transparent
+
+    Gdiplus::SolidBrush bgBrush(bgCol);
+    g.FillRectangle(&bgBrush, (float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top));
+
+    // Draw cached white icon mask, tinted to the desired color via ColorMatrix
+    Gdiplus::Bitmap *mask = GetIconMask(icon, size);
+    if (mask) {
+        Gdiplus::Color col(GetRValue(textColor), GetGValue(textColor), GetBValue(textColor));
+        float tr = col.GetR() / 255.0f, tg = col.GetG() / 255.0f, tb = col.GetB() / 255.0f;
+        Gdiplus::ColorMatrix cm = {
+            tr, 0, 0, 0, 0,
+            0, tg, 0, 0, 0,
+            0, 0, tb, 0, 0,
+            0, 0, 0, 1, 0,
+            0, 0, 0, 0, 1
+        };
+        Gdiplus::ImageAttributes ia; ia.SetColorMatrix(&cm);
+        int is = size * 3 / 4; // icon drawn slightly smaller than button
+        int ix = cx - is / 2, iy = cy - is / 2;
+        if (press) {
+            // slight press offset
+            ix += 1; iy += 1;
+        }
+        g.DrawImage(mask, Gdiplus::Rect(ix, iy, is, is),
+                    0, 0, (Gdiplus::REAL)size, (Gdiplus::REAL)size, Gdiplus::UnitPixel, &ia);
+    }
 }
 
 enum EventTheme { EVENT_NONE, EVENT_HALLOWEEN, EVENT_CHRISTMAS, EVENT_RAMADAN, EVENT_EID, EVENT_ASHURA };
@@ -1996,6 +2300,8 @@ static EventTheme g_lastEvent = EVENT_NONE;
 static void InitEventParticles(EventTheme ev) {
     g_evParticles.clear();
     RECT rc; GetClientRect(g_hWnd, &rc);
+    if (rc.right < 1) rc.right = 1;
+    if (rc.bottom < 1) rc.bottom = 1;
     srand((unsigned)time(NULL));
     if (ev == EVENT_CHRISTMAS) {
         for (int i = 0; i < 150; i++) {
@@ -2050,6 +2356,7 @@ static void UpdateEventParticles() {
     if (ev != g_lastEvent) { g_lastEvent = ev; InitEventParticles(ev); }
     if (g_evParticles.empty()) return;
     RECT rc; GetClientRect(g_hWnd, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0) return;
     if (ev == EVENT_CHRISTMAS) {
         for (auto &p : g_evParticles) {
             p.vy += 0.015f;
@@ -2126,25 +2433,42 @@ static void DrawTitleBar(HDC hdc, const RECT &rc) {
             nCols=7;
             break;
         }
-        Gdiplus::LinearGradientBrush br(Gdiplus::PointF(0,0),Gdiplus::PointF(360,0),cols[0],cols[0]);
-        br.SetInterpolationColors(cols,pos,nCols);
-        br.SetWrapMode(Gdiplus::WrapModeTile);
-        br.TranslateTransform((float)g_rainbowTick,0);
-        // Glow pass — blurred rainbow underneath
-        Gdiplus::Bitmap glowBmp(tw, TITLE_H, PixelFormat32bppPARGB);
-        Gdiplus::Graphics gb(&glowBmp);
-        gb.FillRectangle(&br, Gdiplus::Rect(0, 0, tw, TITLE_H));
-        Gdiplus::BlurParams bp = {6.0f, FALSE};
-        Gdiplus::Blur blur; blur.SetParameters(&bp);
-        glowBmp.ApplyEffect(&blur, NULL);
-        Gdiplus::ColorMatrix cm = {
-            1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,0.4f,0, 0,0,0,0,1
-        };
-        Gdiplus::ImageAttributes ia; ia.SetColorMatrix(&cm);
-        g.DrawImage(&glowBmp, Gdiplus::Rect(rc.left, rc.top, tw, TITLE_H),
-            0, 0, tw, TITLE_H, Gdiplus::UnitPixel, &ia);
-        // Sharp rainbow on top
-        g.FillRectangle(&br, Gdiplus::Rect(rc.left, rc.top, tw, TITLE_H));
+
+        // Rebuild cached rainbow bitmap only when width changes (alpha fade is applied at draw time)
+        bool needRebuild = (g_rainbowBmp == NULL || g_rainbowBmpW != tw || g_rainbowBmpDirty);
+        if (needRebuild) {
+            if (g_rainbowBmp) { delete g_rainbowBmp; g_rainbowBmp = NULL; }
+            g_rainbowBmp = new Gdiplus::Bitmap(tw, TITLE_H, PixelFormat32bppPARGB);
+            g_rainbowBmpW = tw;
+            Gdiplus::Graphics gb(g_rainbowBmp);
+            Gdiplus::LinearGradientBrush br(Gdiplus::PointF(0,0),Gdiplus::PointF(360,0),cols[0],cols[0]);
+            br.SetInterpolationColors(cols,pos,nCols);
+            br.SetWrapMode(Gdiplus::WrapModeTile);
+            gb.FillRectangle(&br, Gdiplus::Rect(0, 0, tw, TITLE_H));
+            g_rainbowBmpDirty = false;
+        }
+
+        // Draw cached rainbow tiled across the title bar with scrolling offset
+        float scrollX = (float)(-(int)g_rainbowTick % tw);
+        for (int t = -1; t <= 1; t++) {
+            float dx = scrollX + (float)t * (float)tw;
+            g.DrawImage(g_rainbowBmp, Gdiplus::Rect((LONG)(rc.left + dx), rc.top, tw, TITLE_H),
+                        0, 0, (Gdiplus::REAL)tw, (Gdiplus::REAL)TITLE_H, Gdiplus::UnitPixel);
+        }
+
+        // Optional subtle glow — applies feed-in/feed-out alpha at draw time
+        float ra = g_rainbowAlpha / 255.0f;
+        if (ra > 0.15f) {
+            Gdiplus::ColorMatrix cm = {
+                1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,0.25f * ra,0, 0,0,0,0,1
+            };
+            Gdiplus::ImageAttributes ia; ia.SetColorMatrix(&cm);
+            for (int t = -1; t <= 1; t++) {
+                float dx = scrollX + (float)t * (float)tw;
+                g.DrawImage(g_rainbowBmp, Gdiplus::Rect((LONG)(rc.left + dx), rc.top, tw, TITLE_H),
+                            0, 0, (Gdiplus::REAL)tw, (Gdiplus::REAL)TITLE_H, Gdiplus::UnitPixel, &ia);
+            }
+        }
     } else {
         HBRUSH hb=CreateSolidBrush(COL_TITLE_BG);
         FillRect(hdc,&tr,hb); DeleteObject(hb);
@@ -2183,58 +2507,34 @@ static void DrawTitleBar(HDC hdc, const RECT &rc) {
     }
     for(int i=BTN_SEARCH;i<BTN_LAST;i++){
         BtnID id=(BtnID)i; RECT&br=g_btnRects[id];
-        COLORREF bg = COL_TITLE_BG, tc = COL_TEXT;
-        if(id==BTN_CLOSE){
-            if(id==g_pressBtn) { bg=RGB(0xBF,0x0F,0x1C); tc=RGB(0xFF,0xFF,0xFF); }
-            else if(id==g_hoverBtn) { bg=RGB(0xE8,0x11,0x23); tc=RGB(0xFF,0xFF,0xFF); }
+        bool hover = (id == g_hoverBtn);
+        bool press = (id == g_pressBtn);
+
+        // Button background
+        Gdiplus::Graphics gg(hdc);
+        gg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Color bgCol(0, 0, 0, 0);
+        if (id == BTN_CLOSE) {
+            if (press) bgCol = Gdiplus::Color(255, 0xBF, 0x0F, 0x1C);
+            else if (hover) bgCol = Gdiplus::Color(255, 0xE8, 0x11, 0x23);
         } else {
-            if(id==g_pressBtn) bg=RGB(0x4A,0x4A,0x4A);
-            else if(id==g_hoverBtn) bg=RGB(0x3A,0x3A,0x3A);
+            if (press) bgCol = Gdiplus::Color(255, 0x4A, 0x4A, 0x4A);
+            else if (hover) bgCol = Gdiplus::Color(255, 0x3A, 0x3A, 0x3A);
         }
-        bool interacting = (id==g_pressBtn || id==g_hoverBtn);
-        if(!g_playing || !g_rainbowEnabled || interacting) {
-            HBRUSH hbb=CreateSolidBrush(bg); FillRect(hdc,&br,hbb); DeleteObject(hbb);
-        }
-        if(id==BTN_CLOSE){
-            HPEN hp=CreatePen(PS_SOLID,1,tc);
-            HPEN op=(HPEN)SelectObject(hdc,hp);
-            SelectObject(hdc,GetStockObject(NULL_BRUSH));
-            int cx=(br.left+br.right)/2, cy=(br.top+br.bottom)/2;
-            MoveToEx(hdc,cx-5,cy-5,NULL); LineTo(hdc,cx+5,cy+5);
-            MoveToEx(hdc,cx+5,cy-5,NULL); LineTo(hdc,cx-5,cy+5);
-            SelectObject(hdc,op); DeleteObject(hp);
-        } else if(id==BTN_SEARCH){
-            HPEN hp=CreatePen(PS_SOLID,1,tc);
-            HPEN op=(HPEN)SelectObject(hdc,hp);
-            SelectObject(hdc,GetStockObject(NULL_BRUSH));
-            int cx=(br.left+br.right)/2, cy=(br.top+br.bottom)/2;
-            Ellipse(hdc,cx-5,cy-5,cx+3,cy+3);
-            MoveToEx(hdc,cx+1,cy+1,NULL); LineTo(hdc,cx+6,cy+6);
-            SelectObject(hdc,op); DeleteObject(hp);
-        } else if(id==BTN_EQ){
-            wchar_t eq[]=L"EQ";
-            SetTextColor(hdc,tc); SelectObject(hdc,g_hFontBold);
-            DrawTextW(hdc,eq,-1,&br,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        } else {
-            HPEN hp=CreatePen(PS_SOLID,1,tc);
-            HPEN op=(HPEN)SelectObject(hdc,hp);
-            SelectObject(hdc,GetStockObject(NULL_BRUSH));
-            int cx=(br.left+br.right)/2, cy=(br.top+br.bottom)/2;
-            if(id==BTN_MINIMIZE){
-                MoveToEx(hdc,cx-6,cy,NULL); LineTo(hdc,cx+6,cy);
-            } else if(id==BTN_MAXIMIZE){
-                Rectangle(hdc,cx-6,cy-5,cx+6,cy+5);
-            } else {
-                SelectObject(hdc, GetStockObject(DC_BRUSH));
-                SetDCBrushColor(hdc, tc);
-                int s=2;
-                Ellipse(hdc,cx-5,cy-5,cx-5+s*2,cy-5+s*2);
-                Ellipse(hdc,cx-1,cy-6,cx-1+s*2,cy-6+s*2);
-                Ellipse(hdc,cx+3,cy-5,cx+3+s*2,cy-5+s*2);
-                Ellipse(hdc,cx-3,cy,cx-3+s*3,cy+s*3);
-            }
-            SelectObject(hdc,op); DeleteObject(hp);
-        }
+        Gdiplus::SolidBrush bgBrush(bgCol);
+        gg.FillRectangle(&bgBrush, (float)br.left, (float)br.top, (float)(br.right - br.left), (float)(br.bottom - br.top));
+
+        // Icon
+        IconType ic;
+        Gdiplus::Color col(GetRValue(COL_TEXT), GetGValue(COL_TEXT), GetBValue(COL_TEXT));
+        if (id == BTN_CLOSE) ic = ICON_CLOSE;
+        else if (id == BTN_SEARCH) ic = ICON_SEARCH;
+        else if (id == BTN_EQ) ic = ICON_EQ;
+        else if (id == BTN_WIDGET) ic = ICON_WIDGET;
+        else if (id == BTN_MINIMIZE) ic = ICON_MINIMIZE;
+        else if (id == BTN_MAXIMIZE) ic = ICON_MAXIMIZE;
+        else ic = ICON_CLOSE;
+        DrawModernIcon(gg, ic, (br.left + br.right) / 2, (br.top + br.bottom) / 2, min(br.right - br.left, br.bottom - br.top), col, press);
     }
 }
 
@@ -2459,8 +2759,33 @@ static void DrawSettingsPanel(HDC hdc) {
     SelectObject(hdc, oap); DeleteObject(aPen);
     g_audioDdBtn = ddR;
 
+    // More customizability options
+    int optY = devY + 56;
+    auto DrawCheck = [&](int y, bool checked, const wchar_t *label, RECT &outBox) {
+        outBox = {px + 16, y, px + 30, y + 14};
+        HPEN cbPen = CreatePen(PS_SOLID, 1, COL_TEXT_DIM);
+        HPEN ocb = (HPEN)SelectObject(hdc, cbPen);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, outBox.left, outBox.top, outBox.right, outBox.bottom);
+        SelectObject(hdc, ocb); DeleteObject(cbPen);
+        if (checked) {
+            HPEN cChk = CreatePen(PS_SOLID, 2, g_accentColor);
+            HPEN ocChk = (HPEN)SelectObject(hdc, cChk);
+            MoveToEx(hdc, outBox.left + 2, outBox.top + 7, NULL);
+            LineTo(hdc, outBox.left + 5, outBox.top + 11);
+            LineTo(hdc, outBox.left + 11, outBox.top + 3);
+            SelectObject(hdc, ocChk); DeleteObject(cChk);
+        }
+        SetTextColor(hdc, COL_TEXT);
+        SelectObject(hdc, g_hFont);
+        RECT cl = {px + 34, y - 2, px + pw - 12, y + 16};
+        DrawTextW(hdc, label, -1, &cl, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    };
+    DrawCheck(optY, g_minimizeToTray, L"Minimize to tray instead of taskbar", g_trayChkRect);
+    DrawCheck(optY + 26, g_startCompact, L"Start in compact mode", g_startCompactRect);
+
     // Cache section
-    int cacheY = devY + 52;
+    int cacheY = devY + 108;
     HPEN caSep = CreatePen(PS_SOLID, 1, COL_TEXT_DIM);
     HPEN ocaSep = (HPEN)SelectObject(hdc, caSep);
     MoveToEx(hdc, px + 12, cacheY, NULL); LineTo(hdc, px + pw - 12, cacheY);
@@ -2579,81 +2904,44 @@ static void DrawBottomBar(HDC hdc, const RECT &rc) {
     DrawTextW(hdc,cs,-1,&cR,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     DrawTextW(hdc,ms,-1,&mR2,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
-    // Bottom buttons — drawn as GDI shapes
-    for(int i=BTN_SHUFFLE;i<=BTN_NEXT;i++){
-        BtnID id=(BtnID)i; RECT&b=g_btnRects[id];
-        COLORREF bg; if(id==g_pressBtn)bg=RGB(0x3A,0x3A,0x3A);else if(id==g_hoverBtn)bg=RGB(0x5A,0x5A,0x5A);else bg=COL_BG_DARK;
-        HBRUSH hbb=CreateSolidBrush(bg); FillRect(hdc,&b,hbb); DeleteObject(hbb);
-        if(id==g_hoverBtn||id==g_pressBtn){
-            HPEN hp=CreatePen(PS_SOLID,1,COL_TEXT_DIM);
-            HPEN old=(HPEN)SelectObject(hdc,hp);
-            SelectObject(hdc,GetStockObject(NULL_BRUSH));
-            Rectangle(hdc,b.left,b.top,b.right,b.bottom);
-            SelectObject(hdc,old);DeleteObject(hp);
+    // Bottom buttons — modern uniform icons (GDI+)
+    {
+        Gdiplus::Graphics gg(hdc);
+        gg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        for (int i = BTN_SHUFFLE; i <= BTN_NEXT; i++) {
+            BtnID id = (BtnID)i;
+            RECT &b = g_btnRects[id];
+            bool hover = (id == g_hoverBtn);
+            bool press = (id == g_pressBtn);
+            IconType ic;
+            switch (id) {
+            case BTN_PLAY:   ic = (g_playing && !g_paused) ? ICON_PAUSE : ICON_PLAY; break;
+            case BTN_STOP:   ic = ICON_STOP; break;
+            case BTN_PREV:   ic = ICON_PREV; break;
+            case BTN_NEXT:   ic = ICON_NEXT; break;
+            default:         ic = ICON_SHUFFLE; break;
+            }
+            DrawControlBtn(gg, b, ic, COL_TEXT, hover, press);
         }
-        // Draw button shapes
-        switch(id){
-            case BTN_PLAY: DrawBtnShape(hdc,b,(g_playing&&!g_paused)?1:0); break;
-            case BTN_STOP: DrawBtnShape(hdc,b,2); break;
-            case BTN_PREV: DrawBtnShape(hdc,b,3); break;
-            case BTN_NEXT: DrawBtnShape(hdc,b,4); break;
-            case BTN_SHUFFLE: {
-                const wchar_t *rep = L">";
-                if(g_repeatMode==1) rep = L"1";
-                else if(g_repeatMode==2) rep = L"R";
-                SetTextColor(hdc, g_repeatMode ? g_accentColor : COL_TEXT);
-                SelectObject(hdc,g_hFont);
-                SetBkMode(hdc,TRANSPARENT);
-                DrawTextW(hdc,rep,-1,&b,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-                SetTextColor(hdc,COL_TEXT);
-                } break;
-        }
+
+        // Volume icon
+        RECT &vb = g_btnRects[BTN_VOLUME];
+        DrawControlBtn(gg, vb, g_muted ? ICON_VOLUME_MUTE : ICON_VOLUME, COL_TEXT,
+                       (BTN_VOLUME == g_hoverBtn), (BTN_VOLUME == g_pressBtn));
+
+        // Settings button
+        RECT &sb = g_btnRects[BTN_SETTINGS];
+        DrawControlBtn(gg, sb, ICON_SETTINGS, COL_TEXT,
+                       (BTN_SETTINGS == g_hoverBtn), (BTN_SETTINGS == g_pressBtn));
+
+        // Locate button
+        RECT &lb = g_btnRects[BTN_LOCATE];
+        DrawControlBtn(gg, lb, ICON_LOCATE, (g_playing && g_trackIdx >= 0) ? COL_TITLE_TEXT : COL_TEXT_DIM,
+                       (BTN_LOCATE == g_hoverBtn), (BTN_LOCATE == g_pressBtn));
     }
 
-    // Volume icon + slider  (click icon to toggle mute)
-    RECT&vb=g_btnRects[BTN_VOLUME];
-    { COLORREF bg; if(BTN_VOLUME==g_pressBtn)bg=RGB(0x3A,0x3A,0x3A);else if(BTN_VOLUME==g_hoverBtn)bg=RGB(0x5A,0x5A,0x5A);else bg=COL_BG_DARK;
-      HBRUSH hbb=CreateSolidBrush(bg); FillRect(hdc,&vb,hbb); DeleteObject(hbb);
-      if(BTN_VOLUME==g_hoverBtn||BTN_VOLUME==g_pressBtn){
-          HPEN hp=CreatePen(PS_SOLID,1,COL_TEXT_DIM); HPEN old=(HPEN)SelectObject(hdc,hp);
-          SelectObject(hdc,GetStockObject(NULL_BRUSH)); Rectangle(hdc,vb.left,vb.top,vb.right,vb.bottom);
-          SelectObject(hdc,old); DeleteObject(hp);
-      }
-      DrawSpeakerIcon(hdc,vb.left+2,vb.top+2,vb.right-vb.left-4,g_muted?0:g_volume,g_muted);
-    }
-    int vx,vy,vw,vh; VolRect(vx,vy,vw,vh);
-    DrawSliderGDI(hdc,vx,vy,vw,vh,(float)g_volume/1000.0f);
-
-    // Settings button
-    RECT&sb=g_btnRects[BTN_SETTINGS];
-    COLORREF sbg; if(BTN_SETTINGS==g_pressBtn)sbg=RGB(0x3A,0x3A,0x3A);else if(BTN_SETTINGS==g_hoverBtn)sbg=RGB(0x5A,0x5A,0x5A);else sbg=COL_BG_DARK;
-    HBRUSH hsb=CreateSolidBrush(sbg); FillRect(hdc,&sb,hsb); DeleteObject(hsb);
-    if(BTN_SETTINGS==g_hoverBtn||BTN_SETTINGS==g_pressBtn){
-        HPEN hp=CreatePen(PS_SOLID,1,COL_TEXT_DIM);
-        HPEN old=(HPEN)SelectObject(hdc,hp);
-        SelectObject(hdc,GetStockObject(NULL_BRUSH));
-        Rectangle(hdc,sb.left,sb.top,sb.right,sb.bottom);
-        SelectObject(hdc,old);DeleteObject(hp);
-    }
-    SetTextColor(hdc,COL_TEXT);
-    SelectObject(hdc,g_hFont);
-    DrawTextW(hdc,L"\u2699",-1,&sb,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-
-    // Locate button
-    RECT&lb=g_btnRects[BTN_LOCATE];
-    COLORREF lbg; if(BTN_LOCATE==g_pressBtn)lbg=RGB(0x3A,0x3A,0x3A);else if(BTN_LOCATE==g_hoverBtn)lbg=RGB(0x5A,0x5A,0x5A);else lbg=COL_BG_DARK;
-    HBRUSH hlb=CreateSolidBrush(lbg); FillRect(hdc,&lb,hlb); DeleteObject(hlb);
-    if(BTN_LOCATE==g_hoverBtn||BTN_LOCATE==g_pressBtn){
-        HPEN hp=CreatePen(PS_SOLID,1,COL_TEXT_DIM);
-        HPEN old=(HPEN)SelectObject(hdc,hp);
-        SelectObject(hdc,GetStockObject(NULL_BRUSH));
-        Rectangle(hdc,lb.left,lb.top,lb.right,lb.bottom);
-        SelectObject(hdc,old);DeleteObject(hp);
-    }
-    SetTextColor(hdc,g_playing?(g_trackIdx>=0?COL_TITLE_TEXT:COL_TEXT):COL_TEXT_DIM);
-    SelectObject(hdc,g_hFont);
-    wchar_t locTxt[16]; swprintf(locTxt,16,L"\u2295");
-    DrawTextW(hdc,locTxt,-1,&lb,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    int vx, vy, vw, vh; VolRect(vx, vy, vw, vh);
+    DrawSliderGDI(hdc, vx, vy, vw, vh, (float)g_volume / 1000.0f);
 }
 
 static void DrawEventParticles(HDC hdc) {
@@ -2720,38 +3008,52 @@ static void DrawGlassOverlay(HDC hdc, const RECT &rc) {
     if (g_useLightTheme || !g_acrylicBlur || g_blurIntensity <= 0) return;
     float gf = 1.0f - g_blurIntensity / 100.0f;
     if (gf < 0.01f) return;
-    Gdiplus::Graphics gfx(hdc);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0) return;
-    // Frosted glass white tint — stronger at glass end
-    Gdiplus::SolidBrush tintBr(Gdiplus::Color((int)(20 * gf), 255, 255, 255));
-    gfx.FillRectangle(&tintBr, rc.left, rc.top, w, h);
-    // Radial glare spots — liquid glass lighting
-    Gdiplus::SolidBrush spotBr(Gdiplus::Color((int)(15 * gf), 255, 255, 255));
-    gfx.FillEllipse(&spotBr, (Gdiplus::REAL)(rc.left + w * 0.1f), (Gdiplus::REAL)(rc.top + h * 0.35f),
-                    (Gdiplus::REAL)(w * 0.35f), (Gdiplus::REAL)(h * 0.2f));
-    Gdiplus::SolidBrush spotBr2(Gdiplus::Color((int)(10 * gf), 255, 255, 255));
-    gfx.FillEllipse(&spotBr2, (Gdiplus::REAL)(rc.left + w * 0.65f), (Gdiplus::REAL)(rc.top + h * 0.1f),
-                    (Gdiplus::REAL)(w * 0.25f), (Gdiplus::REAL)(h * 0.15f));
-    // Diagonal shine — soft white gradient from top-left
-    Gdiplus::LinearGradientBrush shineBr(
-        Gdiplus::PointF(0, 0),
-        Gdiplus::PointF((Gdiplus::REAL)w * 0.6f, (Gdiplus::REAL)h * 0.4f),
-        Gdiplus::Color((int)(35 * gf), 255, 255, 255),
-        Gdiplus::Color(0, 255, 255, 255));
-    Gdiplus::PointF shPts[4] = {
-        Gdiplus::PointF(0, 0), Gdiplus::PointF((Gdiplus::REAL)w, 0),
-        Gdiplus::PointF((Gdiplus::REAL)w * 0.5f, (Gdiplus::REAL)h * 0.3f), Gdiplus::PointF(0, (Gdiplus::REAL)h * 0.15f)
-    };
-    Gdiplus::GraphicsPath shinePath;
-    shinePath.AddPolygon(shPts, 4);
-    gfx.FillPath(&shineBr, &shinePath);
-    // Subtle inner highlight on top edge
-    Gdiplus::LinearGradientBrush edgeBr(
-        Gdiplus::PointF(0, 0), Gdiplus::PointF(0, 4),
-        Gdiplus::Color((int)(60 * gf), 255, 255, 255),
-        Gdiplus::Color(0, 255, 255, 255));
-    gfx.FillRectangle(&edgeBr, (Gdiplus::REAL)rc.left, (Gdiplus::REAL)rc.top, (Gdiplus::REAL)w, 4.0f);
+
+    // Rebuild cache only when size or blur intensity changes
+    if (g_glassBmpDirty || g_glassBmp == NULL || g_glassBmpW != w || g_glassBmpH != h || g_glassBmpIntensity != g_blurIntensity) {
+        if (g_glassBmp) { delete g_glassBmp; g_glassBmp = NULL; }
+        g_glassBmp = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+        g_glassBmpW = w; g_glassBmpH = h;
+        g_glassBmpIntensity = g_blurIntensity;
+        Gdiplus::Graphics gfx(g_glassBmp);
+        // Very subtle frosted glass tint — let the DWM blur show through
+        Gdiplus::SolidBrush tintBr(Gdiplus::Color((int)(10 * gf), 240, 240, 245));
+        gfx.FillRectangle(&tintBr, 0, 0, w, h);
+        // Minimal radial glare spots — barely visible
+        Gdiplus::SolidBrush spotBr(Gdiplus::Color((int)(8 * gf), 255, 255, 255));
+        gfx.FillEllipse(&spotBr, (Gdiplus::REAL)(w * 0.15f), (Gdiplus::REAL)(h * 0.4f),
+                        (Gdiplus::REAL)(w * 0.25f), (Gdiplus::REAL)(h * 0.15f));
+        Gdiplus::SolidBrush spotBr2(Gdiplus::Color((int)(6 * gf), 255, 255, 255));
+        gfx.FillEllipse(&spotBr2, (Gdiplus::REAL)(w * 0.7f), (Gdiplus::REAL)(h * 0.15f),
+                        (Gdiplus::REAL)(w * 0.2f), (Gdiplus::REAL)(h * 0.12f));
+        // Very subtle diagonal shine
+        Gdiplus::LinearGradientBrush shineBr(
+            Gdiplus::PointF(0, 0),
+            Gdiplus::PointF((Gdiplus::REAL)w * 0.5f, (Gdiplus::REAL)h * 0.5f),
+            Gdiplus::Color((int)(20 * gf), 255, 255, 255),
+            Gdiplus::Color(0, 255, 255, 255));
+        Gdiplus::PointF shPts[4] = {
+            Gdiplus::PointF(0, 0), Gdiplus::PointF((Gdiplus::REAL)w, 0),
+            Gdiplus::PointF((Gdiplus::REAL)w * 0.5f, (Gdiplus::REAL)h * 0.3f), Gdiplus::PointF(0, (Gdiplus::REAL)h * 0.15f)
+        };
+        Gdiplus::GraphicsPath shinePath;
+        shinePath.AddPolygon(shPts, 4);
+        gfx.FillPath(&shineBr, &shinePath);
+        // Subtle inner highlight on top edge
+        Gdiplus::LinearGradientBrush edgeBr(
+            Gdiplus::PointF(0, 0), Gdiplus::PointF(0, 4),
+            Gdiplus::Color((int)(60 * gf), 255, 255, 255),
+            Gdiplus::Color(0, 255, 255, 255));
+        gfx.FillRectangle(&edgeBr, (Gdiplus::REAL)0, (Gdiplus::REAL)0, (Gdiplus::REAL)w, 4.0f);
+        g_glassBmpDirty = false;
+    }
+
+    // Draw cached glass overlay (cheap blit)
+    Gdiplus::Graphics gfx(hdc);
+    gfx.DrawImage(g_glassBmp, Gdiplus::Rect(rc.left, rc.top, w, h),
+                  0, 0, (Gdiplus::REAL)w, (Gdiplus::REAL)h, Gdiplus::UnitPixel);
 }
 
 static void DrawMainArea(HDC hdc, const RECT &rc) {
@@ -2792,24 +3094,41 @@ static void DrawMainArea(HDC hdc, const RECT &rc) {
     }
     int rowLeft = sbLeft + 10;
 
-    // Search box
-    const int searchH = 22;
+    // Search box — always visible at top of browser
+    const int searchH = 24;
     int searchTop = rc.top + PADDING;
-    if (!g_searchBuf.empty() || g_searchFocused) {
-        g_searchBox = {rowLeft, searchTop, rowLeft + bw, searchTop + searchH};
-        HPEN hp=CreatePen(PS_SOLID,1,COL_SLIDER_THUMB);
-        HPEN op=(HPEN)SelectObject(hdc,hp);
-        SelectObject(hdc,GetStockObject(NULL_BRUSH));
-        Rectangle(hdc,g_searchBox.left,g_searchBox.top,g_searchBox.right,g_searchBox.bottom);
-        SelectObject(hdc,op); DeleteObject(hp);
-        RECT sr = g_searchBox; sr.left += 4;
-        std::wstring disp = g_searchBuf.empty() ? L"Type to search\u2026" : g_searchBuf;
-        SetTextColor(hdc, g_searchBuf.empty() ? COL_TEXT_DIM : COL_TEXT);
-        DrawTextW(hdc, disp.c_str(), -1, &sr, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        iy = searchTop + searchH + 4;
+    g_searchBox = {rowLeft, searchTop, rowLeft + bw, searchTop + searchH};
+    // Search box background
+    HBRUSH sbBg = CreateSolidBrush(COL_LIST_BG);
+    FillRect(hdc, &g_searchBox, sbBg);
+    DeleteObject(sbBg);
+    HPEN sbPen = CreatePen(PS_SOLID, 1, g_searchFocused ? g_accentColor : COL_SLIDER_THUMB);
+    HPEN opSb = (HPEN)SelectObject(hdc, sbPen);
+    SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    RoundRect(hdc, g_searchBox.left, g_searchBox.top, g_searchBox.right, g_searchBox.bottom, 6, 6);
+    SelectObject(hdc, opSb); DeleteObject(sbPen);
+    // Search text / placeholder
+    RECT sr = g_searchBox; sr.left += 8; sr.right -= 24;
+    std::wstring disp = g_searchBuf.empty() ? L"Search tracks\u2026" : g_searchBuf;
+    SetTextColor(hdc, g_searchBuf.empty() ? COL_TEXT_DIM : COL_TEXT);
+    DrawTextW(hdc, disp.c_str(), -1, &sr, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+    // Clear (X) button when there is text
+    if (!g_searchBuf.empty()) {
+        RECT clrBtn = {g_searchBox.right - 20, g_searchBox.top + 2, g_searchBox.right - 6, g_searchBox.bottom - 2};
+        HBRUSH clrBg = CreateSolidBrush(RGB(0x2A,0x2A,0x2A));
+        FillRect(hdc, &clrBtn, clrBg);
+        DeleteObject(clrBg);
+        HPEN clrPen = CreatePen(PS_SOLID, 1, COL_TEXT_DIM);
+        HPEN opClr = (HPEN)SelectObject(hdc, clrPen);
+        int ccx = (clrBtn.left + clrBtn.right) / 2, ccy = (clrBtn.top + clrBtn.bottom) / 2;
+        MoveToEx(hdc, ccx - 4, ccy - 4, NULL); LineTo(hdc, ccx + 4, ccy + 4);
+        MoveToEx(hdc, ccx + 4, ccy - 4, NULL); LineTo(hdc, ccx - 4, ccy + 4);
+        SelectObject(hdc, opClr); DeleteObject(clrPen);
+        g_searchClearBtn = clrBtn;
     } else {
-        g_searchBox = {};
+        g_searchClearBtn = {};
     }
+    iy = searchTop + searchH + 8;
 
     // Ensure metadata for visible range + buffer
     CacheMetaRange(g_browserScroll);
@@ -2919,6 +3238,8 @@ static void SaveSettings() {
         v = g_acrylicBlur ? 1 : 0; RegSetValueExW(hk, L"AcrylicBlur", 0, REG_DWORD, (BYTE*)&v, 4);
         v = g_blurIntensity; RegSetValueExW(hk, L"BlurIntensity", 0, REG_DWORD, (BYTE*)&v, 4);
         v = g_eqEnabled ? 1 : 0; RegSetValueExW(hk, L"EQEnabled", 0, REG_DWORD, (BYTE*)&v, 4);
+        v = g_minimizeToTray ? 1 : 0; RegSetValueExW(hk, L"MinimizeToTray", 0, REG_DWORD, (BYTE*)&v, 4);
+        v = g_startCompact ? 1 : 0; RegSetValueExW(hk, L"StartCompact", 0, REG_DWORD, (BYTE*)&v, 4);
         RegSetValueExW(hk, L"EQGains", 0, REG_BINARY, (BYTE*)g_eqGains, sizeof(g_eqGains));
         RegSetValueExW(hk, L"AudioDevice", 0, REG_SZ, (BYTE*)g_audioDeviceId.c_str(), (DWORD)(g_audioDeviceId.size() + 1) * 2);
         RECT wr; GetWindowRect(g_hWnd, &wr);
@@ -2983,7 +3304,7 @@ static void LoadSettings() {
         sz = 4;
         if (RegQueryValueExW(hk, L"WindowAlpha", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
             g_windowAlpha = v; if(g_windowAlpha<20)g_windowAlpha=20; if(g_windowAlpha>255)g_windowAlpha=255;
-            SetLayeredWindowAttributes(g_hWnd,0,g_windowAlpha,LWA_ALPHA);
+            // WindowAlpha no longer applied via layered attributes (WS_EX_LAYERED removed for DWM blur)
         }
         sz = 4;
         if (RegQueryValueExW(hk, L"AccentColor", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
@@ -3009,6 +3330,14 @@ static void LoadSettings() {
         sz = 4;
         if (RegQueryValueExW(hk, L"EQEnabled", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
             g_eqEnabled = (v != 0);
+        }
+        sz = 4;
+        if (RegQueryValueExW(hk, L"MinimizeToTray", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
+            g_minimizeToTray = (v != 0);
+        }
+        sz = 4;
+        if (RegQueryValueExW(hk, L"StartCompact", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
+            g_startCompact = (v != 0);
         }
         DWORD eqSz = sizeof(g_eqGains);
         if (RegQueryValueExW(hk, L"EQGains", 0, NULL, (BYTE*)g_eqGains, &eqSz) != ERROR_SUCCESS) {
@@ -3151,7 +3480,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             g_opacityDragX=pt.x;
             float pct=(float)(pt.x-osx)/(osw-10); if(pct<0)pct=0; if(pct>1)pct=1;
             g_windowAlpha=(int)(pct*255); if(g_windowAlpha<20)g_windowAlpha=20; if(g_windowAlpha>255)g_windowAlpha=255;
-            SetLayeredWindowAttributes(g_hWnd,0,g_windowAlpha,LWA_ALPHA);
+            // WS_EX_LAYERED removed — SetLayeredWindowAttributes no longer applies
             SetCapture(hWnd); InvalidateRect(hWnd,NULL,TRUE); return 0;
         }
         // Accent color swatches (4 rows x 4 cols)
@@ -3188,7 +3517,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             g_acrylicBlur=!g_acrylicBlur;
             if (!g_acrylicBlur) g_blurIntensity = 0;
             else if (g_blurIntensity == 0) g_blurIntensity = 50;
-            SetAcrylicBlur(g_hWnd, g_acrylicBlur ? g_blurIntensity : 0);
+            SetGlassBlur(g_hWnd, g_acrylicBlur ? g_blurIntensity : 0);
             InvalidateRect(hWnd,NULL,TRUE);InvalidateRect(g_hWnd,NULL,TRUE);return 0;
         }
         // Blur intensity slider drag
@@ -3199,7 +3528,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             g_blurIntensity = (int)(pct * 100);
             if (g_blurIntensity < 1) g_blurIntensity = 1;
             if (g_blurIntensity > 100) g_blurIntensity = 100;
-            SetAcrylicBlur(g_hWnd, g_blurIntensity);
+            SetGlassBlur(g_hWnd, g_blurIntensity);
             InvalidateRect(hWnd, NULL, TRUE); return 0;
         }
         // Audio output dropdown button
@@ -3220,13 +3549,22 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             if(cmd>=1000){
                 std::wstring newId = (cmd==1000) ? L"" : g_audioDeviceIds[cmd-1001];
                 if(newId != g_audioDeviceId){
+                    double curPos = g_curSec; // remember playback position
                     g_audioDeviceId=newId;
                     InvalidateRect(hWnd,NULL,TRUE);InvalidateRect(g_hWnd,NULL,TRUE);
                     if(g_playing){
                         int ti=g_trackIdx;
                         bool wasPaused=g_paused;
                         StopAudio();
-                        if(ti>=0&&ti<(int)g_playlist.size()){PlayTrack(ti,false);g_paused=wasPaused;}
+                        if(ti>=0&&ti<(int)g_playlist.size()){
+                            PlayTrack(ti,false);
+                            if(curPos > 0.0) SeekTo(curPos); // resume at the same position
+                            if(wasPaused){
+                                g_audioPaused=true; g_paused=true;
+                                if(g_pAudioClient) g_pAudioClient->Stop();
+                                UpdateSMTC();
+                            }
+                        }
                     }
                 }
             }
@@ -3246,6 +3584,17 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             InvalidateRect(g_hWnd, NULL, TRUE);
             return 0;
         }
+        // Customizability checkboxes
+        if(PtInRect(&g_trayChkRect, pt)){
+            g_minimizeToTray = !g_minimizeToTray;
+            InvalidateRect(hWnd, NULL, TRUE); InvalidateRect(g_hWnd, NULL, TRUE);
+            return 0;
+        }
+        if(PtInRect(&g_startCompactRect, pt)){
+            g_startCompact = !g_startCompact;
+            InvalidateRect(hWnd, NULL, TRUE); InvalidateRect(g_hWnd, NULL, TRUE);
+            return 0;
+        }
         return 0;
     }
     case WM_MOUSEMOVE:{
@@ -3262,14 +3611,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             g_blurIntensity=(int)(pct*100);
             if(g_blurIntensity<1)g_blurIntensity=1;
             if(g_blurIntensity>100)g_blurIntensity=100;
-            SetAcrylicBlur(g_hWnd, g_blurIntensity);
+            SetGlassBlur(g_hWnd, g_blurIntensity);
             InvalidateRect(hWnd,NULL,TRUE); return 0;
         }
         if(g_opacityDragX>=0){
             int osx=85, osw=200;
             float pct=(float)(pt.x-osx)/(osw-10); if(pct<0)pct=0; if(pct>1)pct=1;
             g_windowAlpha=(int)(pct*255); if(g_windowAlpha<20)g_windowAlpha=20; if(g_windowAlpha>255)g_windowAlpha=255;
-            SetLayeredWindowAttributes(g_hWnd,0,g_windowAlpha,LWA_ALPHA);
+            // WS_EX_LAYERED removed — SetLayeredWindowAttributes no longer applies
         }
         return 0;
     }
@@ -3638,6 +3987,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_DESTROY:
+        UnregisterHotKey(hWnd, 1);
+        UnregisterHotKey(hWnd, 2);
+        UnregisterHotKey(hWnd, 3);
+        UnregisterHotKey(hWnd, 4);
+        if (g_rainbowBmp) { delete g_rainbowBmp; g_rainbowBmp = NULL; }
+        if (g_glassBmp) { delete g_glassBmp; g_glassBmp = NULL; }
+        if (g_vizBrush) { DeleteObject(g_vizBrush); g_vizBrush = NULL; }
+        DestroyBackbuffer();
         g_metaThreadRun = false;
         if (g_hMetaWakeEvent) SetEvent(g_hMetaWakeEvent);
         if (g_hMetaThread) {
@@ -3665,11 +4022,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_SIZE:
         GetClientRect(hWnd,&g_rcClient);
         CalcLayout(g_rcClient);
+        g_rainbowBmpDirty = true; // rebuild cached rainbow on resize
+        g_glassBmpDirty = true;   // rebuild cached glass on resize
+        // Only recreate backbuffer when window has valid dimensions (not minimized)
+        if (g_rcClient.right > 0 && g_rcClient.bottom > 0) {
+            HDC screenDC = GetDC(NULL);
+            EnsureBackbuffer(screenDC, g_rcClient.right, g_rcClient.bottom);
+            ReleaseDC(NULL, screenDC);
+        }
         InvalidateRect(hWnd,NULL,TRUE);
+        if (wParam == SIZE_MINIMIZED && g_minimizeToTray) {
+            ShowWindow(hWnd, SW_HIDE); // hide to tray instead of taskbar
+        }
         break;
 
     case WM_PAINT:{
         PAINTSTRUCT ps; HDC hdc=BeginPaint(hWnd,&ps);
+        // Skip drawing if window is minimized or has invalid dimensions (prevents crash on minimize)
+        if (IsIconic(hWnd) || g_rcClient.right <= 0 || g_rcClient.bottom <= 0) {
+            EndPaint(hWnd,&ps);
+            break;
+        }
         if(g_compactMode){
             HDC mDC=CreateCompatibleDC(hdc);
             HBITMAP mBM=CreateCompatibleBitmap(hdc,g_rcClient.right,g_rcClient.bottom);
@@ -3682,30 +4055,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             EndPaint(hWnd, &ps);
             break;
         }
-        HDC mDC=CreateCompatibleDC(hdc);
-        HBITMAP mBM=CreateCompatibleBitmap(hdc,g_rcClient.right,g_rcClient.bottom);
-        HBITMAP oBM=(HBITMAP)SelectObject(mDC,mBM);
 
-        // Fill background
+        // Check if only the title bar region needs repainting (rainbow scroll)
+        bool titleOnly = (ps.rcPaint.bottom <= TITLE_H && ps.rcPaint.top >= 0);
+
+        if (titleOnly) {
+            // Rainbow scroll: draw title bar directly, don't touch the rest of the UI
+            DrawTitleBar(hdc, g_rcClient);
+            EndPaint(hWnd, &ps);
+            break;
+        }
+
+        HDC screenDC = GetDC(NULL);
+        EnsureBackbuffer(screenDC, g_rcClient.right, g_rcClient.bottom);
+        ReleaseDC(NULL, screenDC);
+
+        // Fill backbuffer background
         RECT fr={0,0,g_rcClient.right,g_rcClient.bottom};
-        HBRUSH fbr=CreateSolidBrush(COL_BG); FillRect(mDC,&fr,fbr); DeleteObject(fbr);
+        HBRUSH fbr=CreateSolidBrush(COL_BG); FillRect(g_backDC,&fr,fbr); DeleteObject(fbr);
 
-        DrawTitleBar(mDC,g_rcClient);
+        DrawTitleBar(g_backDC,g_rcClient);
         RECT mRc=g_rcClient; mRc.top+=TITLE_H; mRc.bottom-=BOTTOM_H;
-        DrawMainArea(mDC,mRc);
-        DrawBottomBar(mDC,g_rcClient);
-        DrawEventParticles(mDC);
+        DrawMainArea(g_backDC,mRc);
+        DrawBottomBar(g_backDC,g_rcClient);
+        DrawEventParticles(g_backDC);
 
         // Tooltip for hovered button
         if (g_hoverBtn != BTN_NONE && g_btnTooltips[g_hoverBtn]) {
-            SelectObject(mDC, g_hFont);
+            SelectObject(g_backDC, g_hFont);
             RECT &br = g_btnRects[g_hoverBtn];
             int mx = (br.left + br.right) / 2, my = br.top;
-            DrawTooltip(mDC, g_btnTooltips[g_hoverBtn], mx, my);
+            DrawTooltip(g_backDC, g_btnTooltips[g_hoverBtn], mx, my);
         }
 
-        BitBlt(hdc,0,0,g_rcClient.right,g_rcClient.bottom,mDC,0,0,SRCCOPY);
-        SelectObject(mDC,oBM); DeleteObject(mBM); DeleteDC(mDC);
+        BitBlt(hdc,0,0,g_rcClient.right,g_rcClient.bottom,g_backDC,0,0,SRCCOPY);
         EndPaint(hWnd,&ps);
         break;
     }
@@ -3767,10 +4150,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     else if(i==2) TogglePause();
                     else if(i==3 && g_trackIdx<(int)g_playlist.size()-1) PlayTrack(g_trackIdx+1,true);
                     else if(i==4){
-                            int ns=(int)g_curSec+10;
-                        if(g_maxSec>0&&ns>g_maxSec) ns=g_maxSec;
-                        if(g_pReader||g_useVorbis) SeekTo((double)ns);
-                        g_curSec=ns;
+                        g_compactMode = false;
+                        SetWindowPos(hWnd, NULL,
+                            g_normalRect.left, g_normalRect.top,
+                            g_normalRect.right - g_normalRect.left,
+                            g_normalRect.bottom - g_normalRect.top, SWP_NOZORDER);
+                        InvalidateRect(hWnd, NULL, TRUE);
                     }
                     cHit=true;
                     InvalidateRect(hWnd,NULL,TRUE);
@@ -3824,6 +4209,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             InvalidateRect(hWnd, NULL, TRUE);
             break;
         }
+        // Click on the inline search box to focus it
+        if (g_hasFolder && PtInRect(&g_searchBox, pt)) {
+            g_searchFocused = true; SetFocus(hWnd);
+            InvalidateRect(hWnd, NULL, TRUE);
+            break;
+        }
+        // Click the clear (X) button
+        if (!g_searchBuf.empty() && PtInRect(&g_searchClearBtn, pt)) {
+            g_searchBuf.clear(); g_filteredIndices.clear(); g_searchFocused = false;
+            InvalidateRect(hWnd, NULL, TRUE);
+            break;
+        }
 
         // Resize grip
         if(pt.x>=g_rcClient.right-RESIZE_BORDER && pt.y>=g_rcClient.bottom-RESIZE_BORDER){
@@ -3866,7 +4263,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int idx = g_browserScroll + (pt.y - TITLE_H - PADDING) / 44;
                 if (g_hasFolder) {
                     // Account for search box height
-                    int searchH = (!g_searchBuf.empty() || g_searchFocused) ? 22 + 4 : 0;
+                    int searchH = 24 + 8; // always-visible search bar
                     int adjY = pt.y - TITLE_H - PADDING - searchH;
                     idx = g_browserScroll + adjY / 44;
                 }
@@ -4034,7 +4431,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             case BTN_STOP: if(g_playing){g_userStop=true;StopAudio();} break;
             case BTN_PREV: if(g_trackIdx>0)PlayTrack(g_trackIdx-1,true); break;
             case BTN_NEXT: if(g_trackIdx<(int)g_playlist.size()-1)PlayTrack(g_trackIdx+1,true); break;
-            case BTN_SHUFFLE: g_repeatMode = (g_repeatMode + 1) % 3; g_repeatOnce=false; InvalidateRect(hWnd,NULL,TRUE); break;
+            case BTN_SHUFFLE: g_repeatMode = (g_repeatMode + 1) % 3; g_repeatOnce=false; ClearIconCache(); InvalidateRect(hWnd,NULL,TRUE); break;
             case BTN_SETTINGS:
                 if(g_hSettingsWnd&&IsWindowVisible(g_hSettingsWnd)){
                     ShowWindow(g_hSettingsWnd,SW_HIDE);
@@ -4142,18 +4539,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_TIMER:{
         static DWORD s_lastThumbs = 0;
         DWORD now = GetTickCount();
-        if(g_playing && !g_paused) {
-            g_rainbowTick = (g_rainbowTick + 1) % 360;
-            if(g_useVorbis) g_curSec = (double)g_decPCM.readPos / g_decPCM.channels / g_decPCM.sampleRate;
-            else g_curSec = g_lastSamplePos / 10000000.0;
+
+        // Rainbow title feed-in / feed-out animation
+        if (g_playing && g_rainbowEnabled && g_rainbowAlpha < 255) {
+            g_rainbowAlpha = (BYTE)min(255, g_rainbowAlpha + 12);
         }
-        if(!g_playing) g_rainbowTick = 0;
+        if (!g_rainbowEnabled && g_rainbowAlpha > 0) {
+            g_rainbowAlpha = (BYTE)max(0, g_rainbowAlpha - 12);
+        }
+
+        if (g_playing && !g_paused) {
+            g_rainbowTick = (g_rainbowTick + 1) % 360;
+            if (g_useVorbis) g_curSec = (double)g_decPCM.readPos / g_decPCM.channels / g_decPCM.sampleRate;
+            else g_curSec = g_lastSamplePos / 10000000.0;
+        } else {
+            g_rainbowTick = 0;
+        }
+
         UpdateEventParticles();
-        if(now - s_lastThumbs >= 250) {
+        if (now - s_lastThumbs >= 250) {
             s_lastThumbs = now;
             LoadVisibleThumbs();
         }
-        InvalidateRect(g_hWnd,NULL,TRUE);
+
+        // Always repaint when playing so animations stay smooth (like original)
+        if (g_playing || g_rainbowAlpha > 0 || g_evParticles.size() > 0) {
+            InvalidateRect(g_hWnd, NULL, TRUE);
+        }
         break;
     }
 
@@ -4162,7 +4574,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_APP + 1:
         SaveMetaCache();
+        // Refresh the settings window so the cache size (0b -> actual) updates
+        if (g_hSettingsWnd) InvalidateRect(g_hSettingsWnd, NULL, TRUE);
         return 0;
+
+    case WM_HOTKEY:
+        // Global media hotkeys (FN + media keys) work even when not focused
+        switch (wParam) {
+        case 1: TogglePause(); break;                 // play / pause
+        case 2: if (g_trackIdx < (int)g_playlist.size() - 1) PlayTrack(g_trackIdx + 1, true); break; // next
+        case 3: if (g_trackIdx > 0) PlayTrack(g_trackIdx - 1, true); break; // previous
+        case 4: if (g_playing) { g_userStop = true; StopAudio(); } break; // stop
+        }
+        break;
 
     default: return DefWindowProcW(hWnd,msg,wParam,lParam);
     }
@@ -4178,82 +4602,92 @@ RECT g_compCatR;
 
 static void DrawCompactMode(HDC hdc, const RECT &rc) {
     SetBkMode(hdc, TRANSPARENT);
-    // Rainbow bar at top
-    RECT rbR = {rc.left, rc.top, rc.right, rc.top + 6};
-    if(g_playing && !g_paused && g_rainbowEnabled){
-        Gdiplus::Graphics g(hdc);
-        Gdiplus::Rect gr(0, 0, rc.right, 6);
+    Gdiplus::Graphics g(hdc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+    // Background
+    Gdiplus::SolidBrush bgBr(Gdiplus::Color(255, 0x12, 0x12, 0x12));
+    g.FillRectangle(&bgBr, (float)rc.left, (float)rc.top, (float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
+
+    // Rainbow bar at top (always visible when a track is loaded, fades with alpha)
+    RECT rbR = {rc.left, rc.top, rc.right, rc.top + 5};
+    {
+        Gdiplus::Rect gr(0, 0, rc.right, 5);
         Gdiplus::LinearGradientBrush br(gr, Gdiplus::Color(255,255,0,0), Gdiplus::Color(255,255,0,0), Gdiplus::LinearGradientModeHorizontal);
-        Gdiplus::Color cols[7];
+        Gdiplus::Color cols[7] = {
+            Gdiplus::Color(255,255,0,0), Gdiplus::Color(255,255,255,0), Gdiplus::Color(255,0,255,0),
+            Gdiplus::Color(255,0,255,255), Gdiplus::Color(255,0,0,255), Gdiplus::Color(255,255,0,255), Gdiplus::Color(255,255,0,0)
+        };
         float pos[7] = {0,1.0f/6,2.0f/6,3.0f/6,4.0f/6,5.0f/6,1};
-        cols[0].SetFromCOLORREF(RGB(255,0,0));
-        cols[1].SetFromCOLORREF(RGB(255,255,0));
-        cols[2].SetFromCOLORREF(RGB(0,255,0));
-        cols[3].SetFromCOLORREF(RGB(0,255,255));
-        cols[4].SetFromCOLORREF(RGB(0,0,255));
-        cols[5].SetFromCOLORREF(RGB(255,0,255));
-        cols[6].SetFromCOLORREF(RGB(255,0,0));
+        float cra = g_rainbowAlpha / 255.0f;
+        if (cra < 1.0f) {
+            for (int cci = 0; cci < 7; cci++) {
+                Gdiplus::Color &c = cols[cci];
+                c = Gdiplus::Color((BYTE)(c.GetAlpha() * cra), c.GetR(), c.GetG(), c.GetB());
+            }
+        }
         br.SetInterpolationColors(cols, pos, 7);
         g.TranslateTransform((float)g_rainbowTick, 0);
         g.FillRectangle(&br, gr);
-    } else {
-        HBRUSH hb = CreateSolidBrush(COL_TITLE_BG);
-        FillRect(hdc, &rbR, hb); DeleteObject(hb);
+        g.TranslateTransform(-(float)g_rainbowTick, 0);
     }
 
-    // Cat hand button (clickable to return to full mode) + track title
-    g_compCatR = {rc.right-56, 8, rc.right-8, 48};
-    SelectObject(hdc, GetStockObject(DC_BRUSH));
-    SetDCBrushColor(hdc, RGB(0x3A,0x2A,0x4A));
-    HPEN cp = CreatePen(PS_SOLID, 1, RGB(0xBB,0x88,0xFF));
-    HPEN oc = (HPEN)SelectObject(hdc, cp);
-    RoundRect(hdc, g_compCatR.left, g_compCatR.top, g_compCatR.right, g_compCatR.bottom, 10, 10);
-    SelectObject(hdc, oc); DeleteObject(cp);
-    SetTextColor(hdc, RGB(0xDD,0xBB,0xFF));
-    SelectObject(hdc, g_hFontBold);
-    DrawTextW(hdc, L"\U0001F431", -1, &g_compCatR, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    std::wstring title;
-    if(g_trackIdx >= 0 && g_trackIdx < (int)g_playlist.size()){
+    // Track title
+    std::wstring title = L"No track";
+    if (g_trackIdx >= 0 && g_trackIdx < (int)g_playlist.size()) {
         title = g_playlist[g_trackIdx];
         size_t dot = title.rfind(L'.');
-        if(dot != std::wstring::npos) title = title.substr(0, dot);
-        if(!g_artistName.empty()) title = title + L" - " + g_artistName;
-    } else title = L"No track";
-    SetTextColor(hdc, RGB(0xE0,0xE0,0xF0));
-    SelectObject(hdc, g_hFont);
-    RECT tiR = {8, 10, rc.right-64, 36};
-    DrawTextW(hdc, title.c_str(), -1, &tiR, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+        if (dot != std::wstring::npos) title = title.substr(0, dot);
+        if (!g_artistName.empty()) title = title + L" - " + g_artistName;
+    }
+    Gdiplus::FontFamily fontFamily(L"Segoe UI");
+    Gdiplus::Font font(&fontFamily, 12.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::SolidBrush titleBr(Gdiplus::Color(255, 0xE0, 0xE0, 0xF0));
+    Gdiplus::RectF titleRect(8.0f, 10.0f, (float)(rc.right - 70), 20.0f);
+    Gdiplus::StringFormat fmt;
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsLineLimit);
+    g.DrawString(title.c_str(), -1, &font, titleRect, &fmt, &titleBr);
+
+    // Status dot (playing/paused)
+    Gdiplus::Color dotCol = (g_playing && !g_paused) ? Gdiplus::Color(255, 0x1D, 0xB9, 0x54) : Gdiplus::Color(255, 0x66, 0x66, 0x66);
+    Gdiplus::SolidBrush dotBr(dotCol);
+    g.FillEllipse(&dotBr, 5.0f, 20.0f, 6.0f, 6.0f);
 
     // Time
     wchar_t tbuf[32];
-    int gcs=(int)g_curSec, min = gcs/60, sec = gcs%60;
-    int tmin = g_maxSec/60, tsec = g_maxSec%60;
+    int gcs = (int)g_curSec, min = gcs / 60, sec = gcs % 60;
+    int tmin = g_maxSec / 60, tsec = g_maxSec % 60;
     swprintf(tbuf, 32, L"%d:%02d / %d:%02d", min, sec, tmin, tsec);
-    SetTextColor(hdc, g_useLightTheme ? COL_TEXT : RGB(0xFF,0xFF,0xFF));
-    SelectObject(hdc,g_hFontBold);
-    SIZE tsz; GetTextExtentPoint32W(hdc,tbuf,(int)wcslen(tbuf),&tsz);
-    RECT tmR={(rc.right-tsz.cx)/2,44,(rc.right+tsz.cx)/2,64};
-    DrawTextW(hdc,tbuf,-1,&tmR,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    Gdiplus::Font timeFont(&fontFamily, 11.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    Gdiplus::SolidBrush timeBr(Gdiplus::Color(255, 0xFF, 0xFF, 0xFF));
+    Gdiplus::RectF timeRect(0.0f, 32.0f, (float)rc.right, 18.0f);
+    fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    g.DrawString(tbuf, -1, &timeFont, timeRect, &fmt, &timeBr);
 
-    // Control buttons
-    int bw = 40, bh = 32, gap = 8, total = bw * 5 + gap * 4;
-    int sx = (rc.right - total) / 2, sy = 72;
-    for(int i=0;i<5;i++){
-        SetRect(&g_compBtns[i], sx+i*(bw+gap), sy, sx+i*(bw+gap)+bw, sy+bh);
-        HBRUSH hbb = CreateSolidBrush(RGB(0x2A,0x2A,0x3A));
-        FillRect(hdc, &g_compBtns[i], hbb); DeleteObject(hbb);
-        HPEN hp = CreatePen(PS_SOLID, 1, RGB(0x5A,0x4A,0x6A));
-        HPEN op = (HPEN)SelectObject(hdc, hp);
-        SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, g_compBtns[i].left, g_compBtns[i].top, g_compBtns[i].right, g_compBtns[i].bottom);
-        SelectObject(hdc, op); DeleteObject(hp);
-        SetTextColor(hdc, RGB(0xD0,0xD0,0xE0));
-        DrawTextW(hdc, g_compBtnTxt[i], -1, &g_compBtns[i], DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    // Control buttons — modern uniform icons
+    int bw = 34, bh = 30, gap = 7, total = bw * 5 + gap * 4;
+    int sx = (rc.right - total) / 2, sy = 58;
+    IconType icons[5] = {ICON_PREV, ICON_STOP, g_playing && !g_paused ? ICON_PAUSE : ICON_PLAY, ICON_NEXT, ICON_WIDGET};
+    for (int i = 0; i < 5; i++) {
+        RECT br = {sx + i * (bw + gap), sy, sx + i * (bw + gap) + bw, sy + bh};
+        g_compBtns[i] = br;
+        DrawControlBtn(g, br, icons[i], RGB(0xD0, 0xD0, 0xE0), false, false);
     }
+
+    // Return-to-full button (top-right)
+    g_compCatR = {rc.right - 44, 8, rc.right - 8, 30};
+    DrawControlBtn(g, g_compCatR, ICON_WIDGET, RGB(0xBB, 0x88, 0xFF), false, false);
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    // Set AppUserModelID so Windows associates this process with SMTC
+    // and shows it in the Quick Settings / Action Center media panel (like Firefox).
+    SetCurrentProcessExplicitAppUserModelID(L"LITE.MusicPlayer");
+
     MFStartup(MF_VERSION, MFSTARTUP_FULL);
     g_hInst=hInstance;
     Gdiplus::GdiplusStartupInput gsi; GdiplusStartup(&g_gdiplusToken,&gsi,NULL);
@@ -4285,12 +4719,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     eqc.lpszClassName=L"LiteEQ";
     RegisterClassW(&eqc);
 
-    HWND hWnd=CreateWindowExW(WS_EX_LAYERED,L"LitePlayerCPP",L"LITE Music Player",
+    HWND hWnd=CreateWindowExW(0,L"LitePlayerCPP",L"LITE Music Player",
         WS_VISIBLE|WS_POPUP|WS_CLIPCHILDREN,
         CW_USEDEFAULT,CW_USEDEFAULT,700,520,
         NULL,NULL,hInstance,NULL);
     if(!hWnd) return 1;
-    SetLayeredWindowAttributes(hWnd, 0, g_windowAlpha, LWA_ALPHA);
+    // No WS_EX_LAYERED — DWM acrylic blur needs a non-layered window to compose behind
 
     g_hSettingsWnd=CreateWindowExW(0,L"LiteSettings",L"Settings",
         WS_POPUP,
@@ -4304,9 +4738,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     LoadSettings();
     EnumerateAudioDevices();
-    SetAcrylicBlur(hWnd, g_acrylicBlur ? g_blurIntensity : 0);
+    SetGlassBlur(hWnd, g_acrylicBlur ? g_blurIntensity : 0);
     InitSMTC(hWnd);
     InitTrayIcon(hWnd);
+
+    // Register global media hotkeys so FN + Stop / Next / Prev / Play-Pause
+    // work even when the player window is not focused.
+    RegisterHotKey(hWnd, 1, 0, VK_MEDIA_PLAY_PAUSE);
+    RegisterHotKey(hWnd, 2, 0, VK_MEDIA_NEXT_TRACK);
+    RegisterHotKey(hWnd, 3, 0, VK_MEDIA_PREV_TRACK);
+    RegisterHotKey(hWnd, 4, 0, VK_MEDIA_STOP);
 
     // Start background metadata scanning thread
     InitializeCriticalSection(&g_metaCS);
@@ -4318,6 +4759,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     UpdateWindow(hWnd);
     SetTimer(hWnd,1,16,NULL);
 
+    // Start in compact (cat) mode if the user enabled it
+    if (g_startCompact && !g_compactMode) {
+        g_compactMode = true;
+        GetWindowRect(hWnd, &g_normalRect);
+        SetWindowPos(hWnd, NULL, 0, 0, COMPACT_W, COMPACT_H, SWP_NOMOVE|SWP_NOZORDER);
+        InvalidateRect(hWnd, NULL, TRUE);
+    }
+
     if (g_hasFolder && g_trackIdx >= 0 && g_trackIdx < (int)g_playlist.size()) {
         PlayTrack(g_trackIdx, false);
         ScrollToCurrentTrack();
@@ -4327,6 +4776,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     while(GetMessage(&msg,NULL,0,0)){TranslateMessage(&msg);DispatchMessage(&msg);}
 
     KillTimer(hWnd,1);
+    if (g_rainbowBmp) { delete g_rainbowBmp; g_rainbowBmp = NULL; }
+    if (g_glassBmp) { delete g_glassBmp; g_glassBmp = NULL; }
+    if (g_vizBrush) { DeleteObject(g_vizBrush); g_vizBrush = NULL; }
+    ClearIconCache();
+    DestroyBackbuffer();
     if(g_hAudioThread){g_audioRun=false;
         if(WaitForSingleObject(g_hAudioThread,200)!=WAIT_OBJECT_0) TerminateThread(g_hAudioThread,0);
         CloseHandle(g_hAudioThread);g_hAudioThread=NULL;}
