@@ -3,8 +3,6 @@
 A lightweight, native Windows music player written in C++ with the Win32 API. No frameworks, no web tech — just a single `.cpp` file and a pure Win32 UI.
 <img width="805" height="578" alt="image" src="https://github.com/user-attachments/assets/e4a49acf-dfb9-491e-9612-e0d747736d55" />
 
-<img width="805" height="578" alt="image" src="https://github.com/user-attachments/assets/e4a49acf-dfb9-491e-9612-e0d747736d55" />
-
 ## Features
 
 ### Audio & Playback
