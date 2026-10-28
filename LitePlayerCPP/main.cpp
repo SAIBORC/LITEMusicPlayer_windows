@@ -52,11 +52,11 @@
 #include "resource.h"
 #include "stb_vorbis.h"
 
-// Window opacity (acrylic blur works best at full opacity).
+// Window opacity (acrylic blur works with layered window).
 static int            g_windowAlpha   = 255;
 
 // ---------------------------------------------------------------------------
-// Acrylic blur — shows blurred content from behind the window (macOS glass style)
+// Acrylic blur — shows blurred content from behind the window
 // Uses SetWindowCompositionAttribute with ACCENT_ENABLE_ACRYLICBLUR
 // ---------------------------------------------------------------------------
 struct ACCENTPOLICY { DWORD state; DWORD flags; DWORD color; DWORD animId; };
@@ -69,22 +69,12 @@ static void InitWCA() {
         if (h) s_wca = (WCAFunc)GetProcAddress(h, "SetWindowCompositionAttribute");
     }
 }
-static void SetGlassBlur(HWND hw, int intensity) {
+static void SetAcrylicBlur(HWND hw, bool enable) {
     InitWCA();
     if (!s_wca) return;
     ACCENTPOLICY ap = {};
-    WINCOMPATTR wc = {19, &ap, sizeof(ap)}; // 19 = WCA_ACCENT_POLICY
-    if (intensity > 0) {
-        ap.state = 4; // ACCENT_ENABLE_ACRYLICBLUR
-        int a = intensity * 180 / 100;
-        if (a > 180) a = 180;
-        // Tint color: light glass at low intensity -> dark blur at high intensity
-        int c = 0xE0 - (intensity * 0xC8 / 100);
-        if (c < 0x20) c = 0x20;
-        ap.color = (DWORD)((a << 24) | (c << 16) | (c << 8) | c);
-    } else {
-        ap.state = 0; // ACCENT_DISABLED
-    }
+    WINCOMPATTR wc = {19, &ap, sizeof(ap)};
+    if (enable) { ap.state = 4; ap.color = 0x99121212; }
     s_wca(hw, &wc);
 }
 
@@ -3304,7 +3294,6 @@ static void LoadSettings() {
         sz = 4;
         if (RegQueryValueExW(hk, L"WindowAlpha", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
             g_windowAlpha = v; if(g_windowAlpha<20)g_windowAlpha=20; if(g_windowAlpha>255)g_windowAlpha=255;
-            // WindowAlpha no longer applied via layered attributes (WS_EX_LAYERED removed for DWM blur)
         }
         sz = 4;
         if (RegQueryValueExW(hk, L"AccentColor", 0, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) {
@@ -3480,7 +3469,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             g_opacityDragX=pt.x;
             float pct=(float)(pt.x-osx)/(osw-10); if(pct<0)pct=0; if(pct>1)pct=1;
             g_windowAlpha=(int)(pct*255); if(g_windowAlpha<20)g_windowAlpha=20; if(g_windowAlpha>255)g_windowAlpha=255;
-            // WS_EX_LAYERED removed — SetLayeredWindowAttributes no longer applies
+            SetLayeredWindowAttributes(g_hWnd,0,g_windowAlpha,LWA_ALPHA);
+            SetAcrylicBlur(g_hWnd,g_acrylicBlur);
             SetCapture(hWnd); InvalidateRect(hWnd,NULL,TRUE); return 0;
         }
         // Accent color swatches (4 rows x 4 cols)
@@ -3517,7 +3507,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             g_acrylicBlur=!g_acrylicBlur;
             if (!g_acrylicBlur) g_blurIntensity = 0;
             else if (g_blurIntensity == 0) g_blurIntensity = 50;
-            SetGlassBlur(g_hWnd, g_acrylicBlur ? g_blurIntensity : 0);
+            SetAcrylicBlur(g_hWnd,g_acrylicBlur);
             InvalidateRect(hWnd,NULL,TRUE);InvalidateRect(g_hWnd,NULL,TRUE);return 0;
         }
         // Blur intensity slider drag
@@ -3528,7 +3518,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             g_blurIntensity = (int)(pct * 100);
             if (g_blurIntensity < 1) g_blurIntensity = 1;
             if (g_blurIntensity > 100) g_blurIntensity = 100;
-            SetGlassBlur(g_hWnd, g_blurIntensity);
+            SetAcrylicBlur(g_hWnd,g_blurIntensity > 0);
             InvalidateRect(hWnd, NULL, TRUE); return 0;
         }
         // Audio output dropdown button
@@ -3611,14 +3601,14 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             g_blurIntensity=(int)(pct*100);
             if(g_blurIntensity<1)g_blurIntensity=1;
             if(g_blurIntensity>100)g_blurIntensity=100;
-            SetGlassBlur(g_hWnd, g_blurIntensity);
+            SetAcrylicBlur(g_hWnd,g_blurIntensity > 0);
             InvalidateRect(hWnd,NULL,TRUE); return 0;
         }
         if(g_opacityDragX>=0){
             int osx=85, osw=200;
             float pct=(float)(pt.x-osx)/(osw-10); if(pct<0)pct=0; if(pct>1)pct=1;
             g_windowAlpha=(int)(pct*255); if(g_windowAlpha<20)g_windowAlpha=20; if(g_windowAlpha>255)g_windowAlpha=255;
-            // WS_EX_LAYERED removed — SetLayeredWindowAttributes no longer applies
+            SetLayeredWindowAttributes(g_hWnd,0,g_windowAlpha,LWA_ALPHA);
         }
         return 0;
     }
@@ -4719,12 +4709,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     eqc.lpszClassName=L"LiteEQ";
     RegisterClassW(&eqc);
 
-    HWND hWnd=CreateWindowExW(0,L"LitePlayerCPP",L"LITE Music Player",
+    HWND hWnd=CreateWindowExW(WS_EX_LAYERED,L"LitePlayerCPP",L"LITE Music Player",
         WS_VISIBLE|WS_POPUP|WS_CLIPCHILDREN,
         CW_USEDEFAULT,CW_USEDEFAULT,700,520,
         NULL,NULL,hInstance,NULL);
     if(!hWnd) return 1;
-    // No WS_EX_LAYERED — DWM acrylic blur needs a non-layered window to compose behind
+    SetLayeredWindowAttributes(hWnd, 0, g_windowAlpha, LWA_ALPHA);
 
     g_hSettingsWnd=CreateWindowExW(0,L"LiteSettings",L"Settings",
         WS_POPUP,
@@ -4738,7 +4728,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     LoadSettings();
     EnumerateAudioDevices();
-    SetGlassBlur(hWnd, g_acrylicBlur ? g_blurIntensity : 0);
+    SetAcrylicBlur(hWnd,g_acrylicBlur);
     InitSMTC(hWnd);
     InitTrayIcon(hWnd);
 
